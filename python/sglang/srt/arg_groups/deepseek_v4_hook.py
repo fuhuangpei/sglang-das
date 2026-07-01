@@ -68,6 +68,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
                 server_args.speculative_eagle_topk == 1
             ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
+    if server_args.disaggregation_mode != "null" and server_args.pp_size > 1:
+        # get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized
+        # flat KV ptrs by PP layer range.
+        raise ValueError(
+            f"V4 PD disaggregation requires pp_size=1, got pp_size={server_args.pp_size}."
+        )
+
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
