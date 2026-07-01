@@ -446,6 +446,45 @@ class CompressorBackendMixin:
         attr_name = f"c{compress_ratio}_out_loc"
         return getattr(self.forward_metadata.core_metadata, attr_name)
 
+    def _forward_compress_bf16(
+        self,
+        *,
+        kv_score_buffer: torch.Tensor,
+        kv_score_input: torch.Tensor,
+        ape: torch.Tensor,
+        head_dim: int,
+        norm: RMSNorm,
+        freqs_cis_cache: torch.Tensor,
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        assert compress_ratio == 4 or compress_ratio == 128
+        plan = self._get_paged_compress_metadata(compress_ratio)
+        is_online = _use_online_compress(compress_ratio)
+        if is_online:
+            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+        else:
+            coff = 2 if is_overlap_compress(compress_ratio) else 1
+            last_dim = 2 * head_dim * coff
+            assert kv_score_buffer.shape[-1] == last_dim
+            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+        kv_compressed = compress_forward(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score_input,
+            ape=ape.view(-1, head_dim),
+            plan=plan,
+            compress_ratio=compress_ratio,
+            head_dim=head_dim,
+            is_online=is_online,
+        )
+        compress_fused_norm_rope_inplace(
+            kv_compressed,
+            norm.weight,
+            getattr(norm, "eps", norm.variance_epsilon),
+            freqs_cis_cache,
+            plan,
+        )
+        return kv_compressed
+
     def _forward_compress_all_in_one(
         self,
         *,

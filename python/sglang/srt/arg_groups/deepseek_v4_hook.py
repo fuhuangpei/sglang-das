@@ -52,6 +52,12 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             f"Setting max_running_requests to {server_args.max_running_requests} for {model_arch}."
         )
 
+    if server_args.kv_cache_dtype == "bfloat16":
+        envs.SGLANG_OPT_USE_COMPRESSOR_V2.set(False)
+        logger.info(
+            "Disable DSV4 compressor_v2 for bfloat16 KV cache; using BF16 direct-store compressor path."
+        )
+
     if server_args.speculative_algorithm is not None:
         assert server_args.speculative_algorithm in (
             "EAGLE",

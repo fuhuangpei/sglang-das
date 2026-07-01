@@ -120,7 +120,35 @@ _is_hcu = is_hcu()
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
-        if self.use_mla_backend:
+        if is_deepseek_v4(self.model_config.hf_config):
+            if self.kv_cache_dtype == torch.bfloat16:
+                cell_size = (
+                    (
+                        self.model_config.qk_nope_head_dim
+                        + self.model_config.qk_rope_head_dim
+                    )
+                    * num_layers
+                    * kv_size
+                )
+            else:
+                assert kv_size == 1, kv_size
+                cell_size = (
+                    (
+                        self.model_config.qk_nope_head_dim
+                        + self.model_config.qk_rope_head_dim * 2
+                        + self.model_config.qk_nope_head_dim
+                        // 64
+                        + 1
+                    )
+                    * num_layers
+                    * kv_size
+                )
+            indexer_size_per_token = (
+                self.model_config.index_head_dim
+                + self.model_config.index_head_dim // 128 * 4
+            )
+            cell_size += indexer_size_per_token * num_layers
+        elif self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
