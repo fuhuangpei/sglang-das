@@ -106,7 +106,6 @@ from deepgemm import (
     m_grouped_i8_gemm_nt_masked,
     m_grouped_w4a8_gemm_nt_masked,
 )
-from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
@@ -1909,6 +1908,8 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPLLDispatchOutput,
     ):
+        from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
+
         hidden_states, _, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
