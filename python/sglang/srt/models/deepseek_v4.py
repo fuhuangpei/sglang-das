@@ -2406,8 +2406,16 @@ class DeepseekV4Model(nn.Module):
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+        # Produce the pre-hc_head (mHC-stacked, hc_mult*hidden wide) hidden states
+        # whenever hidden capture is active (e.g. EAGLE/NextN spec decoding), not
+        # only when a multi-layer worker sets return_hidden_states_before_norm.
+        # NextN's draft reads spec_info.hidden_states as an hc_mult-stacked tensor;
+        # plain EAGLE never sets that flag, so gate on capture_hidden_mode too.
         need_pre_hc_head = getattr(
             forward_batch, "return_hidden_states_before_norm", False
+        ) or (
+            forward_batch.capture_hidden_mode is not None
+            and forward_batch.capture_hidden_mode.need_capture()
         )
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if dsa_use_prefill_cp(forward_batch):
