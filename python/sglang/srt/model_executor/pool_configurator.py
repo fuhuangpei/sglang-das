@@ -695,6 +695,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return max_running_requests + 1
 
     def _get_c128_state_fixed_bytes(self, max_running_requests: int) -> int:
+        """Bytes reserved for the request-scoped c128 compress-state pool.
+
+        Mirrors CompressStatePool's real allocation so the reservation matches
+        what is actually allocated: rows = round_up(num_req_slots*ring + ring +
+        1, 128) with last_dim = 2*head_dim (non-online), or num_req_slots + ring
+        + 1 with last_dim = 3*head_dim (online, ring collapses to 1)."""
         if self.num_layers_ca128 == 0:
             return 0
 
@@ -719,6 +725,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_c128_state_fixed_bytes_for_token_capacity(
         self, token_capacity: int
     ) -> int:
+        """Estimate the c128 state reservation before max_running_requests is
+        known. Mirrors _resolve_max_num_reqs so the estimate matches finalize."""
         if self.requested_max_running_requests_per_worker is not None:
             return self._get_c128_state_fixed_bytes(
                 self.requested_max_running_requests_per_worker

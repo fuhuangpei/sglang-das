@@ -1572,6 +1572,8 @@ class ModelRunnerKVCacheMixin:
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        # Now that max_running_requests is known, size any request-scoped pools
+        # (DSV4: the c128 compress-state pool). No-op for other architectures.
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = self.server_args.mem_fraction_static

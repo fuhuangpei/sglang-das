@@ -330,6 +330,10 @@ def create_paged_compressor_data(
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
         if compress_ratio == 128:
+            # Request-scoped c128 state: addressed by (req_slot, position),
+            # decoupled from SWA context. Must match the prefill Triton kernel
+            # (create_paged_compress_data_kernel) and the pool sizing in
+            # DSV4PoolConfigurator.finalize_with_max_running_requests.
             state_loc = req_pool_indices * ring_size + positions % ring_size
         else:
             loc = req_to_token[req_pool_indices, positions]

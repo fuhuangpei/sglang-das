@@ -769,6 +769,97 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
+        self._log_pool_stats()
+
+    def _log_pool_stats(self) -> None:
+        """Dump per-pool KV-cache buffer stats (count / shape / dtype / bytes / 占比).
+
+        Diagnostic only: called once at init so every launch prints a table of
+        how much device memory each cache pool actually occupies, per TP rank.
+        Defensive -- never raises into startup."""
+        try:
+
+            def _tensors(obj, attr):
+                buf = getattr(obj, attr, None)
+                return [t for t in (buf or []) if t is not None]
+
+            groups = []  # (name, list[Tensor])
+            groups.append(("swa_kv", _tensors(self.swa_kv_pool, "kv_buffer")))
+            groups.append(("c4_kv", _tensors(self.c4_kv_pool, "kv_buffer")))
+            groups.append(("c128_kv", _tensors(self.c128_kv_pool, "kv_buffer")))
+            groups.append(
+                (
+                    "c4_indexer_kv",
+                    _tensors(self.c4_indexer_kv_pool, "index_k_with_scale_buffer"),
+                )
+            )
+
+            # Compress-state pools, split by ratio (c4 vs c128 attention state).
+            c4_attn, c128_attn = [], []
+            for idx, pool in enumerate(self.compress_state_pools):
+                if pool is None:
+                    continue
+                t = pool.kv_score_buffer.kv_score
+                if self.compression_ratios[idx] == 4:
+                    c4_attn.append(t)
+                else:
+                    c128_attn.append(t)
+            groups.append(("c4_attn_state", c4_attn))
+            groups.append(("c128_attn_state", c128_attn))
+            groups.append(
+                (
+                    "indexer_state",
+                    [
+                        p.kv_score_buffer.kv_score
+                        for p in self.indexer_compress_state_pools
+                        if p is not None
+                    ],
+                )
+            )
+
+            rows = []  # (name, n_layers, shape, dtype, per_layer_bytes, group_bytes)
+            total_bytes = 0
+            for name, tensors in groups:
+                if not tensors:
+                    continue
+                t0 = tensors[0]
+                per_layer_bytes = t0.numel() * t0.element_size()
+                grp_bytes = sum(t.numel() * t.element_size() for t in tensors)
+                total_bytes += grp_bytes
+                rows.append(
+                    (
+                        name,
+                        len(tensors),
+                        tuple(t0.shape),
+                        str(t0.dtype).replace("torch.", ""),
+                        per_layer_bytes,
+                        grp_bytes,
+                    )
+                )
+
+            lines = [
+                "==== DSV4 KV cache pool stats (per TP rank) ====",
+                f"config: max_num_reqs={self.max_num_reqs} swa_size={self.swa_size} "
+                f"c4_size={self.c4_size} c128_size={self.c128_size} "
+                f"c4_state_pool_size={self.c4_state_pool_size} "
+                f"c128_state_pool_size={self.c128_state_pool_size}",
+                f"{'pool':<16}{'#layers':>8}  {'per-layer shape':<26}{'dtype':<10}"
+                f"{'per-layer':>12}{'total':>12}{'占比':>9}",
+            ]
+            for name, n, shape, dtype, pl, gb in rows:
+                pct = (100 * gb / total_bytes) if total_bytes else 0.0
+                lines.append(
+                    f"{name:<16}{n:>8}  {str(shape):<26}{dtype:<10}"
+                    f"{pl / (1 << 20):>10.2f}M{gb / (1 << 30):>11.3f}G{pct:>8.1f}%"
+                )
+            lines.append(
+                f"{'TOTAL':<16}{'':>8}  {'':<26}{'':<10}{'':>11}"
+                f"{total_bytes / (1 << 30):>11.3f}G{100.0:>8.1f}%"
+            )
+            logger.info("\n".join(lines))
+        except Exception as e:  # never break startup on a diagnostic dump
+            logger.warning(f"_log_pool_stats failed: {e}")
+
     @property
     def is_bf16_attention_kv_cache(self) -> bool:
         return self._unified_kv or self.swa_kv_pool.is_bf16_attention_kv_cache
