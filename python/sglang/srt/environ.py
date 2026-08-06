@@ -943,6 +943,12 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # DSV4 SWA sizing: size the SWA KV pool (and its swa-page-addressed c4/indexer
+    # compress-state pools) from the real working set (one prefill chunk +
+    # window x concurrency) reserved as fixed bytes, instead of the
+    # swa_full_tokens_ratio x full_token heuristic. Decouples SWA from full_token
+    # so full_token can grow. Opt-in; default off keeps the ratio behavior.
+    SGLANG_DSV4_SWA_WORKING_SET = EnvBool(False)
     # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)

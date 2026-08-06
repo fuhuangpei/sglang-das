@@ -558,6 +558,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
+        # SWA working-set sizing (opt-in): size the SWA KV pool from the real
+        # working set (one prefill chunk + window x concurrency) reserved as
+        # fixed bytes, decoupled from full_token. See SGLANG_DSV4_SWA_WORKING_SET.
+        self.swa_working_set_mode = envs.SGLANG_DSV4_SWA_WORKING_SET.get()
+        self.chunked_prefill_size = mr.server_args.chunked_prefill_size
+        self.page_size_swa = mr.server_args.page_size  # SWA pool page (=256)
+        # Cached once in calculate_pool_sizes so the reservation and the actual
+        # swa pool size are computed from the same max_running_requests.
+        self._swa_working_tokens_cached: Optional[int] = None
         self.is_speculative = mr.server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
             mr.server_args.max_speculative_num_draft_tokens or 0
@@ -664,14 +673,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
+        # In working-set mode the SWA KV pool and its swa-page-addressed c4/indexer
+        # compress-state pools are reserved as fixed bytes (independent of
+        # full_token), so drop their per-full-token contribution here.
+        swa_coupled = 0.0 if self.swa_working_set_mode else 1.0
         return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
+            swa_coupled * self.swa_ratio * kv_bytes * self.num_layers_total
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
-            + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
+            + swa_coupled
+            * self.swa_ratio
+            * c4_state_ratio
+            * c4_state_bytes
+            * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
-            + self.swa_ratio
+            + swa_coupled * self.swa_ratio
             * c4_state_ratio
             * c4_indexer_state_bytes
             * self.num_layers_ca4
@@ -679,7 +696,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
-        swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        if self.swa_working_set_mode:
+            # Decoupled from full_token: use the cached working-set value computed
+            # in calculate_pool_sizes (from the same max_running_requests as the
+            # swa fixed-bytes reservation). Falls back to the ratio if unset.
+            swa_tokens = (
+                self._swa_working_tokens_cached
+                if self._swa_working_tokens_cached is not None
+                else int(full_token * self.swa_ratio) // page_size * page_size
+            )
+        else:
+            swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
@@ -693,6 +720,63 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.disaggregation_mode == "decode":
             return max_running_requests + self.disaggregation_decode_extra_slots + 1
         return max_running_requests + 1
+
+    def _get_swa_working_tokens(self, max_running_requests: int) -> int:
+        """Real SWA KV working set (tokens), independent of full_token.
+
+        SWA is fixed-window attention (window=swa_page_size), so its live set is
+        bounded by: one prefill chunk (all chunk tokens' SWA KV coexist within a
+        forward before window eviction) + a small window's worth per concurrently
+        decoding request. Sized as a fixed budget in working-set mode."""
+        page = self.page_size_swa
+
+        def align_up(x: int, a: int) -> int:
+            return (x + a - 1) // a * a
+
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+        # Prefill peak: a whole chunk's SWA slots must be live at once (hard floor).
+        # chunked_prefill_size may be None in some configs; fall back to the
+        # model context length as the upper bound.
+        chunk = self.chunked_prefill_size
+        if chunk is None:
+            chunk = self.context_len
+        prefill_term = align_up(chunk, page)
+        # Decode residency: window(<=page) straddles a page boundary -> <=2 pages
+        # per request; 1.25x headroom for page-alignment / concurrency jitter.
+        pages_per_window = 2
+        decode_term = int(
+            1.25 * max(num_req_slots - 1, 0) * pages_per_window * page
+        )
+        swa_tokens = align_up(prefill_term + decode_term, page)
+        assert (
+            swa_tokens >= prefill_term
+        ), "swa working set must hold at least one prefill chunk"
+        return swa_tokens
+
+    def _get_swa_fixed_bytes(self, swa_tokens: int) -> int:
+        """Bytes reserved for the SWA KV pool plus its swa-page-addressed c4/indexer
+        compress-state pools (all sized from swa_tokens). Mirrors the real pool
+        allocations so the reservation matches what is built."""
+        if self.kv_cache_dtype == torch.bfloat16:
+            kv_bytes = (
+                self.qk_nope_head_dim + self.qk_rope_head_dim
+            ) * torch._utils._element_size(self.kv_cache_dtype)
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        state_dtype_size = 4
+        # c4/indexer compress-state pools are addressed by swa page index, so they
+        # scale with swa_tokens exactly as c4_state_pool_size does at build time.
+        c4_state_slots = swa_tokens // self.swa_page_size * self.c4_ring_size
+        c4_state_bytes = 2 * 2 * attn_head_dim * state_dtype_size
+        c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * state_dtype_size
+
+        swa_kv_bytes = swa_tokens * kv_bytes * self.num_layers_total
+        c4_attn_state_bytes = c4_state_slots * c4_state_bytes * self.num_layers_ca4
+        indexer_state_bytes = (
+            c4_state_slots * c4_indexer_state_bytes * self.num_layers_ca4
+        )
+        return swa_kv_bytes + c4_attn_state_bytes + indexer_state_bytes
 
     def _get_c128_state_fixed_bytes(self, max_running_requests: int) -> int:
         """Bytes reserved for the request-scoped c128 compress-state pool.
@@ -786,6 +870,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
         available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+
+        # Reserve the SWA working set (KV + its swa-page-addressed c4/indexer state
+        # pools) up front too, so full_token is computed from the remainder. Uses
+        # the same max_running_requests estimate as the c128 reservation.
+        if self.swa_working_set_mode:
+            if self.requested_max_running_requests_per_worker is not None:
+                mrr_for_swa = self.requested_max_running_requests_per_worker
+            else:
+                _ft_est = int(available_bytes / self.bytes_per_full_token)
+                _est = max(min(int(_ft_est / self.context_len * 512), 4096), 2048)
+                mrr_for_swa = min(_est, _ft_est // 2)
+            self._swa_working_tokens_cached = self._get_swa_working_tokens(mrr_for_swa)
+            swa_fixed_bytes = self._get_swa_fixed_bytes(self._swa_working_tokens_cached)
+        else:
+            swa_fixed_bytes = 0
+        available_bytes_for_tokens = max(
+            available_bytes_for_tokens - swa_fixed_bytes, 0
+        )
+
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
@@ -794,6 +897,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"swa_fixed={swa_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)
