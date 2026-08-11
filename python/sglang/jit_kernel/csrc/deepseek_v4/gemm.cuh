@@ -2,19 +2,20 @@
 // bf16 -> fp32 GEMM kernels for DeepSeek V4 router(N=256)/wkv_gate(N=1024,2048) decode.
 // AMD MFMA (gfx936/928/938).
 // n16 = K-split across warps + smem tree reduce + direct store (deterministic, 1 node).
-// n128 = N-split across warps (large N, A reuse).
+// n64_splitk = async global->LDS load + double buffer + block K-split (b tile < L2) + atomicAdd reduce.
 // ROCm-only; compiled via torch.utils.cpp_extension (hipify converts <<<>>> / at::cuda).
 #if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
 
 #include <ATen/ATen.h>
 #include <c10/macros/Macros.h>
 #include <c10/hip/HIPStream.h>
+#include <cstdint>
 
-using half2_t = __attribute__((__vector_size__(2 * sizeof(_Float16)))) _Float16;
 using half4_t = __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
 using v4bh = __attribute__((__vector_size__(4 * sizeof(short)))) short;
 using float4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 struct half4x2 { half4_t data[2]; };
+using uint32x4_t = uint32_t __attribute__((ext_vector_type(4)));
 
 template<bool is_half = true>
 inline __device__ void builtin_amdgcn_mmac(const half4_t& reg_a, const half4_t& reg_b, float4_t& reg_c) {
@@ -25,6 +26,24 @@ inline __device__ void builtin_amdgcn_mmac(const half4_t& reg_a, const half4_t& 
         if constexpr (is_half) reg_c = __builtin_hcu_mmac_f32_16x16x16_f16_lit_lts(reg_a, reg_b, reg_c, false, false);
         else reg_c = __builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts(*(v4bh*)&reg_a, *(v4bh*)&reg_b, reg_c, false, false);
     #endif
+}
+
+// ---- async global->LDS load helpers (gfx936/938, cp.async equivalent) ----
+__device__ __forceinline__ uint32x4_t make_buffer_resource(const uint32_t *ptr) {
+    uint32x4_t res = {};
+    const uint64_t address = reinterpret_cast<uint64_t>(ptr);
+    res[0] = __builtin_amdgcn_readfirstlane(uint32_t(address));
+    res[1] = __builtin_amdgcn_readfirstlane(uint32_t(address >> 32));
+    res[2] = 0x80000000u;
+    res[3] = 0x00020000u;
+    return res;
+}
+
+// async load 8 bf16 (16B) from gmem[res + gmem_off] to lds[lds_base + lds_off]
+template<typename scalar_t>
+__device__ __forceinline__ void async_load8(scalar_t* lds_base, int lds_off, uint32x4_t res, int gmem_off) {
+    auto *p = (__attribute__((address_space(3))) int*)(lds_base + lds_off);
+    __builtin_hcu_raw_buffer_load_lds(res, p, 16, gmem_off * 2, 0, 0, 0);
 }
 
 // 16x16 tile, 4 warps split K (each K/4) + smem tree reduce + direct fp32 store.
@@ -80,50 +99,79 @@ __global__ void gemm_nt_fp16_fp32out(scalar_t *a, scalar_t *b, float *d, int m, 
     }
 }
 
-// 16x128 tile, 4 warps split N (each 16x32 = 2 MFMA), A reused across both MFMA.
-template <typename scalar_t, int NUM_WARPS = 4, int NPerBlock = 128>
-__global__ void gemm_nt_fp16_fp32out_n128(scalar_t *a, scalar_t *b, float *d, int m, int n, int k) {
-    constexpr int N_PER_WARP = NPerBlock / NUM_WARPS;
-    const int bid_x = blockIdx.x;
-    const int bid_y = blockIdx.y;
-    const int tid = threadIdx.x;
+// n64_splitk: async global->LDS + double buffer + N_TILE=64 + block K-split + atomicAdd.
+// For large M / large N where b (N*K) > L2 (8MB): splitK makes b tile (N_TILE * K/K_SPLIT) < L2.
+template <typename scalar_t, int NUM_WARPS = 4, int NPerBlock = 64, int K_STAGE = 64, int K_SPLIT = 4>
+__global__ void gemm_nt_fp16_fp32out_n64_splitk(scalar_t *a, scalar_t *b, float *d, int m, int n, int k) {
+    constexpr int N_PER_WARP = NPerBlock / NUM_WARPS;  // 16
+    const int bid_x = blockIdx.x, bid_y = blockIdx.y, bid_k = blockIdx.z, tid = threadIdx.x;
     const int warp_idx = __builtin_amdgcn_readfirstlane(tid / C10_WARP_SIZE);
     const int lane = tid % C10_WARP_SIZE;
-    const int rowid = lane % 16;
-    const int rows = lane / 16;
+    const int rowid = lane % 16, rows = lane / 16;
     constexpr bool is_half = std::is_same<scalar_t, at::Half>::value;
     const int row = bid_y * 16 + rowid;
     const int col_warp = bid_x * NPerBlock + warp_idx * N_PER_WARP;
-    const int col0 = col_warp + rowid;
-    const int col1 = col_warp + 16 + rowid;
-    int k_off = rows * 4 * 2;
-    scalar_t *a_ptr = a + row * k + k_off;
-    scalar_t *b_ptr0 = b + col0 * k + k_off;
-    scalar_t *b_ptr1 = b + col1 * k + k_off;
-    float *d_ptr0 = d + row * n + col_warp + rows;
-    float *d_ptr1 = d + row * n + col_warp + 16 + rows;
-    float4_t d0 = {0, 0, 0, 0}, d1 = {0, 0, 0, 0};
-    half4x2 a_vec, b0, b1;
-    a_vec.data[0] = {0, 0, 0, 0};
-    a_vec.data[1] = {0, 0, 0, 0};
-    for (int i = 0; i + 32 <= k; i += 32) {
-        if (row < m) a_vec = *(half4x2 *)(a_ptr + i);
-        b0 = *(half4x2 *)(b_ptr0 + i);
-        b1 = *(half4x2 *)(b_ptr1 + i);
-        builtin_amdgcn_mmac<is_half>(a_vec.data[0], b0.data[0], d0);
-        builtin_amdgcn_mmac<is_half>(a_vec.data[1], b0.data[1], d0);
-        builtin_amdgcn_mmac<is_half>(a_vec.data[0], b1.data[0], d1);
-        builtin_amdgcn_mmac<is_half>(a_vec.data[1], b1.data[1], d1);
+    const int k_off = rows * 8;
+    const int k_per_split = k / K_SPLIT;
+    const int k_start = bid_k * k_per_split;
+    const int nstage = k_per_split / K_STAGE;
+
+    __shared__ scalar_t a_sm[2][16][K_STAGE];
+    __shared__ scalar_t b_sm[2][NPerBlock][K_STAGE];
+    uint32x4_t res_a = make_buffer_resource((const uint32_t *)a);
+    uint32x4_t res_b = make_buffer_resource((const uint32_t *)b);
+    int br_row_base = bid_x * NPerBlock;
+    float4_t d0 = {0, 0, 0, 0};
+
+    // A[16][K_STAGE]=128 dwordx4: tid 0-127, r=tid/8, c8=tid%8. B[NPerBlock][K_STAGE]=512: tid 0-255 x2.
+    auto do_load = [&](int kk, int buf) {
+        if (tid < 128) {
+            int r = tid >> 3, c8 = tid & 7;
+            int ar_row = bid_y * 16 + r;
+            if (ar_row < m) async_load8<scalar_t>(&a_sm[buf][0][0], r * 64 + c8 * 8, res_a, ar_row * k + kk + c8 * 8);
+        }
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int idx = tid + j * 256;
+            int r = idx >> 3, c8 = idx & 7;  // r 0..63
+            async_load8<scalar_t>(&b_sm[buf][0][0], r * 64 + c8 * 8, res_b, (br_row_base + r) * k + kk + c8 * 8);
+        }
+    };
+
+    do_load(k_start, 0);
+    __builtin_amdgcn_s_waitcnt(0xF70);
+    __builtin_amdgcn_s_barrier();
+
+    for (int s = 1; s < nstage; s++) {
+        int nxt = s & 1, cur = nxt ^ 1, kk = k_start + s * K_STAGE;
+        do_load(kk, nxt);
+        #pragma unroll
+        for (int i = 0; i < K_STAGE; i += 32) {
+            half4x2 av = *(half4x2 *)(&a_sm[cur][rowid][k_off + i]);
+            half4x2 bv = *(half4x2 *)(&b_sm[cur][warp_idx * N_PER_WARP + rowid][k_off + i]);
+            builtin_amdgcn_mmac<is_half>(av.data[0], bv.data[0], d0);
+            builtin_amdgcn_mmac<is_half>(av.data[1], bv.data[1], d0);
+        }
+        __builtin_amdgcn_s_waitcnt(0xF70);
+        __builtin_amdgcn_s_barrier();
+    }
+    {
+        int cur = (nstage - 1) & 1;
+        #pragma unroll
+        for (int i = 0; i < K_STAGE; i += 32) {
+            half4x2 av = *(half4x2 *)(&a_sm[cur][rowid][k_off + i]);
+            half4x2 bv = *(half4x2 *)(&b_sm[cur][warp_idx * N_PER_WARP + rowid][k_off + i]);
+            builtin_amdgcn_mmac<is_half>(av.data[0], bv.data[0], d0);
+            builtin_amdgcn_mmac<is_half>(av.data[1], bv.data[1], d0);
+        }
     }
     if (row < m) {
-        for (int i = 0; i < 4; i++) {
-            d_ptr0[i * 4] = d0[i];
-            d_ptr1[i * 4] = d1[i];
-        }
+        float *dp = d + row * n + col_warp + rows;
+        for (int i = 0; i < 4; i++) atomicAdd(&dp[i * 4], d0[i]);
     }
 }
 
-// bf16 [M,K] x bf16 [N,K]^T -> fp32 [M,N]. Shape-directed: n128 for large N+M, n16 otherwise.
+// bf16 [M,K] x bf16 [N,K]^T -> fp32 [M,N]. Shape-directed dispatch.
 at::Tensor gemm_opt_fp32(const at::Tensor &x, const at::Tensor &weight) {
     int m = x.sizes()[0];
     int k = x.sizes()[1];
@@ -133,20 +181,33 @@ at::Tensor gemm_opt_fp32(const at::Tensor &x, const at::Tensor &weight) {
     std::vector<long> size(2);
     size[0] = m;
     size[1] = n;
-    at::Tensor ret = at::empty(size, x.options().dtype(torch::kFloat32));
+    // n64_splitk: b (N*K) > L2 8MB -> splitK makes b tile < L2.
+    // Simple dispatch: N=1024 (b=8MB) any M -> splitK ks8; N=2048 (b=16MB) M>=8 -> splitK ks4;
+    //   N=2048 M<8 -> n16 (b 16MB bw-bound, splitK no gain); N=256 -> n16 (b 2MB < L2).
+    // ks chosen per-N (not per-M) for maintainability; small perf cost at N=1024 M=32 / N=2048 M=32.
+    bool use_splitk = (n % 64 == 0) && (k % 512 == 0) && (n == 1024 || (n == 2048 && m >= 8));
+    int ks = (n == 1024) ? 8 : 4;
+    at::Tensor ret = use_splitk ? at::zeros(size, x.options().dtype(torch::kFloat32))
+                                : at::empty(size, x.options().dtype(torch::kFloat32));
     auto stream = c10::hip::getCurrentHIPStream().stream();
     AT_DISPATCH_REDUCED_FLOATING_TYPES(x.scalar_type(), "gemm_opt_fp32", [&] {
         scalar_t *a = x.data_ptr<scalar_t>();
         scalar_t *b = weight.data_ptr<scalar_t>();
         float *d = ret.data_ptr<float>();
         constexpr int NumWarps = 4;
-        if (n >= 2048 && (n % 128) == 0 && m > 48) {
-            constexpr int NPerBlock = 128;
+        if (use_splitk) {
+            constexpr int NPerBlock = 64, K_STAGE = 64;
             int blocks_x = (n - 1) / NPerBlock + 1;
             int blocks_y = (m - 1) / 16 + 1;
-            dim3 grid(blocks_x, blocks_y);
-            gemm_nt_fp16_fp32out_n128<scalar_t, NumWarps, NPerBlock>
-                <<<grid, NumWarps * C10_WARP_SIZE, 0, stream>>>(a, b, d, m, n, k);
+            if (ks == 8) {
+                dim3 grid(blocks_x, blocks_y, 8);
+                gemm_nt_fp16_fp32out_n64_splitk<scalar_t, NumWarps, NPerBlock, K_STAGE, 8>
+                    <<<grid, NumWarps * C10_WARP_SIZE, 0, stream>>>(a, b, d, m, n, k);
+            } else {
+                dim3 grid(blocks_x, blocks_y, 4);
+                gemm_nt_fp16_fp32out_n64_splitk<scalar_t, NumWarps, NPerBlock, K_STAGE, 4>
+                    <<<grid, NumWarps * C10_WARP_SIZE, 0, stream>>>(a, b, d, m, n, k);
+            }
         } else {
             constexpr int NPerBlock = 16;
             int blocks_x = (n - 1) / NPerBlock + 1;
