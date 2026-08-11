@@ -206,7 +206,8 @@ jobs:
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
             [ -f "$whl" ] || continue
-            CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit $(git rev-parse --short=6 HEAD) --outputdir output -f "$whl"
+            echo "CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit $(git rev-parse --short=6 HEAD) --outputdir output -f $whl"
+            CIUpload REPAIR --dtk_version "${DTK_VER}" --torch_version "${TORCH_VERSION}" --git_commit "$(git rev-parse --short=6 HEAD)" --outputdir output -f "$whl"
           done
           echo "=== Repaired wheels ==="
           ls -lh output/
