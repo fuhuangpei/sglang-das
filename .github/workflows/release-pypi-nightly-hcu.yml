@@ -203,6 +203,10 @@ jobs:
           TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
           LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-6)"
           echo "Local version: ${LOCAL_VER}"
+          echo "=== CIUpload REPAIR --help ==="
+          CIUpload REPAIR --help || true
+          echo "=== CIUpload --help ==="
+          CIUpload --help || true
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
             [ -f "$whl" ] || continue
