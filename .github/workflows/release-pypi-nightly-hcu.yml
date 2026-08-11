@@ -25,7 +25,7 @@ on:
       torch_version:
         description: 'PyTorch version to install'
         required: false
-        default: '2.10.0'
+        default: '2.11.0'
         type: string
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
@@ -39,7 +39,7 @@ on:
       torch_version:
         description: 'PyTorch version to install'
         required: false
-        default: '2.10.0'
+        default: '2.11.0'
         type: string
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
@@ -74,7 +74,7 @@ jobs:
         python-version: ['3.10']
 
     env:
-      TORCH_VERSION: ${{ inputs.torch_version || '2.10.0' }}
+      TORCH_VERSION: ${{ inputs.torch_version || '2.11.0' }}
       SKIP_GATEWAY: ${{ inputs.skip_gateway != false }}
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
@@ -206,7 +206,9 @@ jobs:
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
             [ -f "$whl" ] || continue
-            CIUpload --repair --torch_version $TORCH_VERSION --set_local_version $LOCAL_VER --outputdir output -f "$whl"
+            set -x
+            CIUpload REPAIR --dtk_version "${DTK_VER}" --torch_version "${TORCH_VERSION}" --git_commit "$(git rev-parse --short=6 HEAD)" --outputdir output -f "$whl"
+            set +x
           done
           echo "=== Repaired wheels ==="
           ls -lh output/
