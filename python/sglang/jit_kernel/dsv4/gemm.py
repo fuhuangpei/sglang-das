@@ -264,7 +264,7 @@ def _auto_dispatch_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     N = int(y.shape[0]) if y.stride(1) == 1 else int(y.shape[1])
 
     # decode / small-M: the sgl MFMA kernel dominates for its supported shapes
-    if M <= 64 and N in (256, 1024, 2048):
+    if M <= 64 and N in (256, 512, 1024, 2048):
         return _jit_sgl_gemm_module().gemm_opt_fp32(x, y)
 
     if not _is_hcu:
@@ -302,14 +302,14 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return z
     elif _linear_bf16_fp32_algo == "sgl":
         # sgl bf16->fp32 GEMM: bf16 [M,K] x bf16 [N,K]^T -> fp32 [M,N].
-        # Shape-directed: only router/wkv_gate decode shapes (M<=64, N in
-        # {256,1024,2048}) benefit from the sgl MFMA kernel. Large M (prefill)
-        # and large N (logits/vocab) are bandwidth-limited in the sgl kernel
-        # -> fall back to the cublas path. JIT-compiled from
+        # Shape-directed: only router/indexer/wkv_gate decode shapes (M<=64,
+        # N in {256,512,1024,2048}) benefit from the sgl MFMA kernel. Large M
+        # (prefill) and large N (logits/vocab) are bandwidth-limited in the sgl
+        # kernel -> fall back to the cublas path. JIT-compiled from
         # csrc/deepseek_v4/gemm.cuh (AMD MFMA, ROCm only).
         _M, _K = x.shape
         _N = y.shape[0] if y.stride(1) == 1 else y.shape[1]
-        if _M <= 64 and _N in (256, 1024, 2048):
+        if _M <= 64 and _N in (256, 512, 1024, 2048):
             return _jit_sgl_gemm_module().gemm_opt_fp32(x, y)
         return torch.mm(x, y.t(), out_dtype=torch.float32)
     else:
