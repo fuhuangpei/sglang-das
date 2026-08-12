@@ -461,7 +461,7 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true, bool kInt8 = false>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
@@ -579,23 +579,37 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
       local_max = math::max(local_max, math::abs(data[i]));
     }
     const auto abs_max = warp::reduce_max(local_max);
-    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
-    const auto inv_scale = 1.0f / scale;
-    OutStorage result;
-    result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
-    result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
-
     // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
     auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
-    result.store(out_row, lane_id);
-    params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    if constexpr (kInt8) {
+      const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
+      const auto inv_scale = 1.0f / scale;
+      auto clamp_round_i8 = [](float v) -> uint8_t {
+        v = fminf(fmaxf(v, -127.0f), 127.0f);
+        return static_cast<uint8_t>(static_cast<int8_t>(
+          v >= 0.0f ? floorf(v + 0.5f) : ceilf(v - 0.5f)));
+      };
+      out_row[lane_id * 4 + 0] = clamp_round_i8(data[0] * inv_scale);
+      out_row[lane_id * 4 + 1] = clamp_round_i8(data[1] * inv_scale);
+      out_row[lane_id * 4 + 2] = clamp_round_i8(data[2] * inv_scale);
+      out_row[lane_id * 4 + 3] = clamp_round_i8(data[3] * inv_scale);
+      params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    } else {
+      const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+      const auto inv_scale = 1.0f / scale;
+      OutStorage result;
+      result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
+      result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
+      result.store(out_row, lane_id);
+      params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    }
   }
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true, bool kInt8 = false>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kInt8>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,

@@ -79,6 +79,22 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     )
 
 
+@cache_once
+def _jit_main_q_indexer_rope_hadamard_quant_int8_module(dtype: torch.dtype):
+    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + int8 act-quant."""
+    # Template is <DType, kUsePDL, kRopeFirst, kHadamard, kInt8>: keep the V4
+    # layout/rotation (false, true) and set the trailing kInt8 flag.
+    args = make_cpp_args(dtype, is_arch_support_pdl(), False, True, True)
+    return load_jit(
+        make_name("main_q_indexer_rope_hadamard_quant_int8"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardQuantKernel<{args}>::forward"),
+        ],
+    )
+
+
 # V3.2 lays q out as [rope | nope] (V4 is [nope | rope]) -> kRopeFirst=true, and
 # drops the Hadamard rotation (kHadamard=false).
 @cache_once
@@ -218,6 +234,36 @@ def fused_q_indexer_rope_hadamard_quant(
             positions,
         )
     return q_fp8, weights_out
+
+
+def fused_q_indexer_rope_hadamard_quant_int8(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Int8 variant of fused_q_indexer_rope_hadamard_quant (SGLANG_NSA_INDEX_K_INT8).
+
+    Outputs int8 q + fp32 weights_out. DCU: int8 MFMA (16x16x32) has 2x the
+    throughput of the FP8-dequant-to-bf16 path."""
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    # Kernel-side TensorMatcher expects uint8 storage for the quantized output.
+    q_storage = torch.empty(q_input.shape, dtype=torch.uint8, device=q_input.device)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+    module = _jit_main_q_indexer_rope_hadamard_quant_int8_module(q_input.dtype)
+    module.forward(
+        q_input,
+        q_storage,
+        weight,
+        weights_out,
+        float(weight_scale),
+        freqs_real,
+        positions,
+    )
+    return q_storage.view(torch.int8), weights_out
 
 
 def fused_q_indexer_rope_first_quant(

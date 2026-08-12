@@ -719,6 +719,9 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # DSV4 NSA/DSA indexer: replace FP8 quant with int8 on the KV/Q/scoring
+    # path (DCU gfx936 int8 MFMA 16x16x32 has 2x the FP8-dequant-bf16 throughput).
+    SGLANG_NSA_INDEX_K_INT8 = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

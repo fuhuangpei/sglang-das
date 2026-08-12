@@ -266,13 +266,22 @@ class CompressorBackendMixin:
                 cache_k=new_compressed_kv,
             )
         else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
+            if envs.SGLANG_NSA_INDEX_K_INT8.get():
+                from sglang.srt.layers.attention.dsa.triton_kernel import (
+                    act_quant_int8,
+                )
+
+                new_compressed_kv_quant, new_compressed_kv_scale = act_quant_int8(
+                    new_compressed_kv
+                )
+            else:
+                new_compressed_kv_quant, new_compressed_kv_scale = act_quant(
+                    new_compressed_kv
+                )
             token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
                 loc=out_loc,
-                index_k=new_compressed_kv_fp8,
+                index_k=new_compressed_kv_quant,
                 index_k_scale=new_compressed_kv_scale,
             )
 

@@ -789,6 +789,8 @@ class C4IndexerBackendMixin:
             )
             assert c4_indexer_kv_cache.dim() == 2
             head_dim_with_sf = 68 if use_fp4_indexer else 132
+            if envs.SGLANG_NSA_INDEX_K_INT8.get():
+                c4_indexer_kv_cache = c4_indexer_kv_cache.view(torch.int8)
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
@@ -968,6 +970,14 @@ class C4Indexer(nn.Module):
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+            )
+        if envs.SGLANG_NSA_INDEX_K_INT8.get():
+            from sglang.jit_kernel.dsv4 import (
+                fused_q_indexer_rope_hadamard_quant_int8,
+            )
+
+            return fused_q_indexer_rope_hadamard_quant_int8(
+                q, weight, self.weight_scale, self.freqs_cis, positions
             )
         return fused_q_indexer_rope_hadamard_quant(
             q, weight, self.weight_scale, self.freqs_cis, positions
