@@ -686,7 +686,15 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
                 return StandardCombineInput(hidden_states=output)
-        elif _is_hcu and not _use_fp8_w8a8_moe and _use_aiter_fp8_w8a8_moe:
+        elif (
+            _is_hcu
+            and not _use_fp8_w8a8_moe
+            and _use_aiter_fp8_w8a8_moe
+            # The native AITER path cannot consume EP-local weight shards with
+            # global expert ids. Let the Triton runner filter local experts.
+            and self.moe_runner_config.num_experts
+            == self.moe_runner_config.num_local_experts
+        ):
             if isinstance(layer.w13_weight, tuple):
                 w1 = layer.w13_weight[0]
                 w2 = layer.w2_weight[0]

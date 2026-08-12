@@ -1237,6 +1237,9 @@ def fused_experts_impl(
     if (
         _use_aiter_moe
         and not is_triton_forced_for_dspark_aiter_fallback()
+        # AITER expects a complete expert weight set. EP-local shards keep
+        # global expert ids and require Triton's filter_expert path.
+        and not filter_expert
         and (use_int4_w4a16 or use_int8_w8a8 or use_fp8_w8a8)
         and hidden_states.dtype == torch.bfloat16
     ):

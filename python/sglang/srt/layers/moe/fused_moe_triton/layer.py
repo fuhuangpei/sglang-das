@@ -354,16 +354,10 @@ class FusedMoE(torch.nn.Module):
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
-        assert num_experts % self.moe_ep_size == 0
-        # self.num_local_experts = num_experts // self.moe_ep_size
-        if self.moe_ep_size != 0:
-            self.num_local_experts, self.expert_map = determine_expert_map(
-                ep_size=self.moe_ep_size,
-                ep_rank=self.moe_ep_rank,
-                global_num_experts=num_experts,
-            )
-        else:
-            self.local_num_experts, self.expert_map = (self.global_num_experts, None)
+        # The routed/shared split above is the source of truth. In particular,
+        # DSpark has 256 routed experts plus one fused shared expert, so the
+        # total 257 is not divisible by EP8 even though the routed experts are.
+        self.expert_map = None
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size

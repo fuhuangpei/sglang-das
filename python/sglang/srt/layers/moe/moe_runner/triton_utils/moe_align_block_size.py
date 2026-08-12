@@ -149,7 +149,41 @@ def moe_align_block_size(
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
         use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
-    if use_jit_align:
+    if _is_hcu:
+        # The sgl-kernel small-batch implementation launches 256 token
+        # threads plus one thread per expert. With 32 EP-local experts this
+        # rounds up to 320 threads on HCU, exceeding the kernel's 256-thread
+        # launch bound and eventually causing a VMFault.
+        #
+        # StandardDispatcher represents experts owned by other EP ranks as
+        # -1. LightOp expects non-negative ids, so route them through one
+        # extra sentinel expert and map the aligned sentinel blocks back to
+        # -1 for the Triton MoE kernel's filter_expert path.
+        invalid_expert = num_experts
+        # LightOp preserves the caller-provided padding value. Triton masks a
+        # row only when its sorted token id is >= topk_ids.numel(); leaving the
+        # torch.empty buffer uninitialized can turn padding into real tokens.
+        sorted_ids.fill_(topk_ids.numel())
+        hcu_topk_ids = torch.where(
+            topk_ids < 0,
+            torch.full_like(topk_ids, invalid_expert),
+            topk_ids,
+        )
+        op.moe_align_block_size(
+            hcu_topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            None,
+            None,
+            None,
+            False,
+            True,
+        )
+        expert_ids.masked_fill_(expert_ids == invalid_expert, -1)
+    elif use_jit_align:
         from sglang.kernels.ops.moe.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,
         )
