@@ -1818,11 +1818,35 @@ class DeepseekV4AttnBackend(
         swa_k_cache_bf16: torch.Tensor,
         swa_page_indices: torch.Tensor,
         swa_topk_lengths: torch.Tensor,
+        flashmla_metadata,
         attn_sink: torch.Tensor,
         extra_k_cache_bf16: Optional[torch.Tensor],
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        use_split_kv_kernel = envs.SGLANG_DSV4_DECODE_MLA_SPLIT_CACHE.get() and (
+            forward_batch.forward_mode.is_decode()
+        )
+        if use_split_kv_kernel:
+            # Route through the split-KV decode operator (flash_mla_with_kvcache
+            # with swa + extra caches passed separately) instead of concatenating
+            # swa_kv and extra_kv into one packed kv tensor, whose concat time is
+            # too long. Same reshape/call pattern as _forward_flash_mla_decode.
+            return self._forward_flash_mla_decode(
+                q=q,
+                swa_k_cache=swa_k_cache_bf16,
+                swa_page_indices=swa_page_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                flashmla_metadata=flashmla_metadata,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache_bf16,
+                extra_indices=extra_indices,
+                extra_topk_lengths=extra_topk_lengths,
+                compress_ratio=0,
+                layer_id=-1,
+            )
+
         try:
             from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
         except ImportError:
@@ -1993,10 +2017,12 @@ class DeepseekV4AttnBackend(
                     swa_k_cache_bf16=swa_k_cache_bf16,
                     swa_page_indices=swa_page_indices,
                     swa_topk_lengths=swa_topk_lengths,
+                    flashmla_metadata=flashmla_metadata,
                     attn_sink=attn_sink,
                     extra_k_cache_bf16=extra_k_cache_bf16,
                     extra_indices=extra_indices,
                     extra_topk_lengths=extra_topk_lengths,
+                    forward_batch=forward_batch,
                 )
 
             if not _is_hcu:
