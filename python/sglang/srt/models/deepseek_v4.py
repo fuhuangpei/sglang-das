@@ -53,6 +53,10 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStatePacker,
+    pack_aux_hidden_states,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -2551,14 +2555,16 @@ class DeepseekV4Model(nn.Module):
         if dspark_layers_to_capture is None:
             dspark_layers_to_capture = self.dspark_layers_to_capture
         capture_dspark = dspark_layers_to_capture is not None
-        if capture_dspark and use_prefill_cp:
+        if capture_dspark and use_prefill_cp and cp_v2_active:
             raise NotImplementedError(
-                "DSpark aux hidden-state capture is not supported together with "
-                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
-                "of them: DSpark static-verify is CP-off for v1."
+                "DSpark aux hidden-state capture does not yet support DeepSeek-V4 "
+                "CP-v2. Use the legacy prefill-CP path."
             )
-        pd_aux_hidden_states: List[torch.Tensor] = list(
-            incoming_pd_aux_hidden_states
+        use_packed_pd_aux = capture_dspark and self.pp_group.world_size == 1
+        pd_aux_hidden_states = (
+            AuxHiddenStatePacker(len(dspark_layers_to_capture))
+            if use_packed_pd_aux
+            else list(incoming_pd_aux_hidden_states)
         )
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
@@ -2620,6 +2626,16 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
+            if capture_dspark:
+                assert isinstance(pd_aux_hidden_states, AuxHiddenStatePacker)
+                pd_aux_hidden = cp_all_gather_rerange_output(
+                    pd_aux_hidden_states.finalize(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            else:
+                pd_aux_hidden = None
             hidden_states = self.hc_head(
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
@@ -2630,8 +2646,15 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            if capture_dspark:
+                return (hidden_states, pre_hc_head), pd_aux_hidden
             return hidden_states, pre_hc_head
         pre_hc_head = hidden_states.flatten(1) if need_pre_hc_head else None
+
+        if isinstance(pd_aux_hidden_states, AuxHiddenStatePacker):
+            pd_aux_hidden = pd_aux_hidden_states.finalize()
+        else:
+            pd_aux_hidden = pd_aux_hidden_states
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
@@ -2651,7 +2674,7 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), pd_aux_hidden_states
+            return (hidden_states, pre_hc_head), pd_aux_hidden
 
         return hidden_states, pre_hc_head
 
@@ -2803,9 +2826,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         if has_pd_hidden_capture:
             hidden_states, pd_aux_hidden_states = hidden_states
             if self.capture_aux_hidden_states:
-                aux_hidden_states = pd_aux_hidden_states
+                aux_hidden_states = pack_aux_hidden_states(pd_aux_hidden_states)
         elif self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+            hidden_states, captured_aux_hidden_states = hidden_states
+            aux_hidden_states = pack_aux_hidden_states(captured_aux_hidden_states)
+            # Eager/static forward-batch wrappers can preserve the global
+            # DSpark capture plan while omitting the per-request PD marker.
+            # A PD prefill target still has to expose those captured layers to
+            # the transfer path instead of relying on LogitsProcessor's request
+            # capture mode to retain them.
+            if self.model.dspark_layers_to_capture is not None:
+                pd_aux_hidden_states = captured_aux_hidden_states
         hidden_states, pre_hc_head = hidden_states
 
         logits_output = self.logits_processor(
@@ -2818,18 +2849,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
-        if (
+        if pd_aux_hidden_states is not None and (
             has_pd_hidden_capture
-            and pd_aux_hidden_states
-            and logits_output.hidden_states is None
+            or self.model.dspark_layers_to_capture is not None
         ):
-            flattened_aux_hidden_states = [
-                x.flatten(1) if x.ndim == 3 else x for x in pd_aux_hidden_states
-            ]
+            # PD hidden transfer must use the requested target-layer captures,
+            # even when CaptureHiddenMode.FULL also populated final-layer state.
+            packed_pd_aux_hidden = pack_aux_hidden_states(pd_aux_hidden_states)
             logits_output.hidden_states = (
-                flattened_aux_hidden_states[0]
-                if len(flattened_aux_hidden_states) == 1
-                else torch.cat(flattened_aux_hidden_states, dim=-1)
+                packed_pd_aux_hidden.flatten(1)
+                if packed_pd_aux_hidden.ndim == 3
+                else packed_pd_aux_hidden
             )
         return logits_output
 
