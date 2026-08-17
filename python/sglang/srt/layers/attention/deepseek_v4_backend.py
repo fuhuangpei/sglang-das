@@ -1825,8 +1825,17 @@ class DeepseekV4AttnBackend(
         extra_topk_lengths: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # Only decode-like batches (decode / idle / target-verify) may use the
+        # split-KV decode operator. Prefill batches must fall through to the
+        # sparse prefill API below: the decode operator treats every query
+        # token as a batch row, which is slow and memory-heavy at prefill token
+        # counts. is_decode() alone is not enough here: with EAGLE spec
+        # decoding the target model never runs ForwardMode.DECODE -- its decode
+        # steps run as TARGET_VERIFY (same predicate as the non-bf16 branch in
+        # forward()).
+        forward_mode = forward_batch.forward_mode
         use_split_kv_kernel = envs.SGLANG_DSV4_DECODE_MLA_SPLIT_CACHE.get() and (
-            forward_batch.forward_mode.is_decode()
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         )
         if use_split_kv_kernel:
             # Route through the split-KV decode operator (flash_mla_with_kvcache
