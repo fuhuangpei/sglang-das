@@ -307,11 +307,25 @@ def _freqs_cis_to_cos_sin(
 _fused_qnorm_rope_cos_sin_cache: dict[tuple, torch.Tensor] = {}
 
 
-def _get_fused_qnorm_rope_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
+def _get_fused_qnorm_rope_cos_sin_cache(
+    freqs_cis: torch.Tensor, rope_base: float, rope_scaling: Optional[dict]
+) -> torch.Tensor:
+    # The [max_pos, 64] fp32 fused table depends only on the rope params
+    # (base / seqlen / yarn factor...), which take ~2 distinct values across
+    # this model (compress vs non-compress rope base). Key on those params
+    # (not data_ptr) so all layers with identical rope params share ONE table:
+    # a per-layer copy wastes ~256 MiB x num_layers of HBM (10.75 GB for a
+    # 43-layer, 1M-context model), enough to starve the KV pool at load time.
+    scaling = rope_scaling or {}
     key = (
         freqs_cis.device.type,
         freqs_cis.device.index,
-        freqs_cis.data_ptr(),
+        int(freqs_cis.shape[0]),
+        float(rope_base),
+        scaling.get("factor"),
+        scaling.get("beta_fast"),
+        scaling.get("beta_slow"),
+        scaling.get("original_max_position_embeddings"),
     )
     cache = _fused_qnorm_rope_cos_sin_cache.get(key)
     if cache is None:
@@ -594,10 +608,9 @@ class MQALayer(MqaAttentionBase):
         self.register_buffer("cos_sin_cache_fused", None, persistent=False)
         self.cos_sin_cache_fused: Optional[torch.Tensor]
         if _is_hcu and _use_fused_qnorm_rope_kv_rope_quant:
-            freqs_real = torch.view_as_real(self.freqs_cis)
-            self.cos_sin_cache_fused = torch.cat(
-                [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
-            ).contiguous()
+            self.cos_sin_cache_fused = _get_fused_qnorm_rope_cos_sin_cache(
+                self.freqs_cis, self.rope_base, self.rope_scaling
+            )
         elif _is_hip and not _is_hcu:
             cos_cache = (
                 self.freqs_cis.real.to(torch.bfloat16).unsqueeze(-2).unsqueeze(-2)

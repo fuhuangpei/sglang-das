@@ -380,6 +380,11 @@ def compress_norm_rope_store(
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
+    if kvcache.ndim != 2:
+        # The bf16 attention pool allocates [num_pages, page_size, 1, kv_dim]
+        # while the fused kernel's TensorMatcher wants the raw 2-D page view
+        # [num_pages, page_bytes]. Same storage, so the view is free.
+        kvcache = kvcache.reshape(kvcache.shape[0], -1)
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
         kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
