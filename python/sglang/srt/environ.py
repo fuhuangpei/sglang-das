@@ -952,6 +952,13 @@ class Envs:
     # swa_full_tokens_ratio x full_token heuristic. Decouples SWA from full_token
     # so full_token can grow. Opt-in; default off keeps the ratio behavior.
     SGLANG_DSV4_SWA_WORKING_SET = EnvBool(False)
+    # Debug: disable the scheduler WAR-barrier fastpath (read-done event) and
+    # always fall back to whole-forward wait_stream. Used to test whether the
+    # replayed decode graph still reads scheduler-shared buffers.
+    SGLANG_DSV4_DISABLE_WAR_FASTPATH = EnvBool(False)
+    # Debug: dump per-replay DSV4 attention metadata (rank0) to
+    # /tmp/dsv4_replay_dump_r0.jsonl for corruption forensics.
+    SGLANG_DSV4_DEBUG_REPLAY_DUMP = EnvBool(False)
     # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)

@@ -245,6 +245,9 @@ class DSV4AttnMetadata:
                 "positions_casual",
                 "c4_out_loc",
                 "c128_out_loc",
+                # Stable backend-owned buffer under graph replay; in-place copy
+                # keeps the captured store kernels' read address valid.
+                "swa_out_cache_loc",
                 "page_table",
                 "swa_page_indices",
                 "swa_topk_lengths",
@@ -259,7 +262,6 @@ class DSV4AttnMetadata:
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
-                "swa_out_cache_loc",
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
@@ -552,6 +554,28 @@ class DeepseekV4AttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
+        # CP topology (attn_cp_size > 1) must keep the decode metadata build
+        # OUT of the CUDA graph. The in-graph raw->full upgrade
+        # (init_forward_metadata_in_graph) mis-executes at replay under CP:
+        # captured decode graphs produce corrupted attention (output degrades
+        # to garbage a few tokens into generation) and the graph-runner warmup
+        # forward can ROCm-VM-fault in a downstream DeepEP LL combine kernel.
+        # The same kernels run correctly when built out-of-graph, and the
+        # non-CP topology is unaffected with in-graph prep enabled. Verified
+        # 2026-08-19 on gfx936 (8xHCU, CP8): PREP=0 eager-built metadata gives
+        # correct decode output under CP with SGLANG_DSV4_DECODE_MLA_SPLIT_CACHE
+        # left enabled; PREP=1 (default) reproduces the corruption.
+        self.prep_in_cuda_graph = (
+            envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
+            and get_parallel().attn_cp_size == 1
+        )
+
+        # Backend-owned stable buffer backing the decode graph's
+        # `swa_out_cache_loc` rail: captured store kernels read this address
+        # and replay-prep (init_forward_metadata_out_graph) refreshes its
+        # contents, so no translate node is recorded inside the graph.
+        self._graph_swa_write_loc_buf: Optional[torch.Tensor] = None
+
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
@@ -695,7 +719,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self.prep_in_cuda_graph:
             return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -709,6 +733,14 @@ class DeepseekV4AttnBackend(
             max_seq_len=max_seq_len,
             out_loc=out_cache_loc,
             need_compress=True,
+        )
+        # Cache the SWA write target on the metadata (eager store fast path;
+        # under graph replay PREP=0 temps feed the swa_out_cache_loc
+        # copy_field). Same value the store-time fallback would compute.
+        core_attn_metadata.swa_out_cache_loc = (
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                torch.int32
+            )
         )
 
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
@@ -833,7 +865,7 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self.prep_in_cuda_graph:
             assert out_cache_loc is not None
             bs = len(seq_lens)
             seq_lens_cpu_list = (
@@ -1141,11 +1173,30 @@ class DeepseekV4AttnBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        out_cache_loc
+                    ).to(torch.int32)
                 )
-            )
+            elif forward_batch.forward_mode.is_decode_or_idle():
+                # Plain decode graph: bind the write loc to the backend-owned
+                # stable buffer (no kernel recorded). Replay-prep refreshes its
+                # contents from the live out_cache_loc before each replay, per
+                # the graph runner's "zero translate nodes in-graph" contract —
+                # an in-graph gather on a floating graph-pool tensor here
+                # produced KV-slot cross-contamination at replay.
+                num_tokens = out_cache_loc.shape[0]
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    self._decode_swa_write_loc_buf(num_tokens)[:num_tokens]
+                )
+            else:
+                # target-verify and other captured modes keep the in-graph
+                # compute (this path is exercised and clean under EAGLE).
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        out_cache_loc
+                    ).to(torch.int32)
+                )
 
             if self.is_dspark_draft and forward_batch.forward_mode.is_target_verify():
                 block_size = int(forward_batch.spec_info.draft_token_num)
@@ -1250,6 +1301,15 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
             )
+            # Replay-prep translate for the decode graph's SWA write-loc rail:
+            # refresh the stable buffer contents out-of-graph so the captured
+            # store kernels read verified already-physical locs (the graph
+            # itself records zero translate nodes on this rail).
+            swa_write_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc_padded
+            ).to(torch.int32)
+            swa_write_buf = self._decode_swa_write_loc_buf(swa_write_loc.shape[0])
+            swa_write_buf[: swa_write_loc.shape[0]].copy_(swa_write_loc)
         elif bucket == _GraphBucket.TARGET_VERIFY and self.is_dspark_draft:
             block_size = self.speculative_num_draft_tokens - 1
             num_tokens_block = block_size * bs
@@ -1532,6 +1592,53 @@ class DeepseekV4AttnBackend(
             return
         chosen_metadata.copy_(temp_metadata)
         self.forward_metadata = chosen_metadata
+        if envs.SGLANG_DSV4_DEBUG_REPLAY_DUMP.get():
+            self._debug_dump_replay(bucket, bs, temp_metadata, chosen_metadata)
+
+    def _debug_dump_replay(self, bucket, bs, temp_metadata, chosen_metadata):
+        """Deterministic-corruption forensic dump (graph replay path only)."""
+        import json
+        import os
+
+        rank = get_parallel().attn_cp_rank
+        if rank != 0:
+            return
+        core = chosen_metadata.core_attn_metadata
+        tcore = temp_metadata.core_attn_metadata
+        # captured swa_out_cache_loc holds the value computed by the PREVIOUS
+        # replay's in-graph translate — i.e. the KV write locs actually used.
+        swa_write = (
+            core.swa_out_cache_loc.tolist()
+            if core.swa_out_cache_loc is not None
+            else None
+        )
+        rec = {
+            "bucket": str(bucket),
+            "bs": int(bs),
+            "seq_lens": tcore.seq_lens_casual.tolist(),
+            "swa_topk_lengths": tcore.swa_topk_lengths.tolist(),
+            "pt_rowsum": tcore.page_table.sum(dim=-1).tolist(),
+            "pt_row0": tcore.page_table[0, : min(8, tcore.page_table.shape[1])].tolist(),
+            "pt_row2": (
+                tcore.page_table[2, : min(8, tcore.page_table.shape[1])].tolist()
+                if tcore.page_table.shape[0] > 2
+                else None
+            ),
+            "prev_swa_write_loc": swa_write,
+            "swa_pi_row0": tcore.swa_page_indices[0, 0, :6].tolist()
+            if tcore.swa_page_indices.ndim == 3
+            else tcore.swa_page_indices[0, :6].tolist(),
+            "swa_pi_row2": (
+                tcore.swa_page_indices[2, 0, :6].tolist()
+                if tcore.swa_page_indices.ndim == 3
+                else tcore.swa_page_indices[2, :6].tolist()
+            )
+            if tcore.swa_page_indices.shape[0] > 2
+            else None,
+        }
+        self._dbg_step = getattr(self, "_dbg_step", 0) + 1
+        with open(f"/tmp/dsv4_replay_dump_r{rank}.jsonl", "a") as f:
+            f.write(json.dumps(rec) + "\n")
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1551,6 +1658,20 @@ class DeepseekV4AttnBackend(
         current_raw = getattr(self, "_current_capture_raw", None)
         if current_raw is not None:
             self.forward_metadata = current_raw
+
+    def _decode_swa_write_loc_buf(self, num_tokens: int) -> torch.Tensor:
+        # Lazily-(re)sized persistent int32 buffer; contents refreshed by
+        # init_forward_metadata_out_graph before every graph replay.
+        buf = self._graph_swa_write_loc_buf
+        if buf is None or buf.numel() < num_tokens:
+            new_numel = max(num_tokens, buf.numel() if buf is not None else 0)
+            buf = torch.zeros(
+                new_numel,
+                dtype=torch.int32,
+                device=self.cuda_int32_kwargs["device"],
+            )
+            self._graph_swa_write_loc_buf = buf
+        return buf
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.

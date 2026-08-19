@@ -1627,10 +1627,18 @@ class Scheduler(
             return
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
-        if ev is not None:
+        # Debug switch: the fastpath assumes the replayed decode graph reads
+        # no scheduler-shared buffer (req_to_token / full_to_swa mapping).
+        # Force the whole-forward wait_stream fallback to test that assumption.
+        if (
+            ev is not None
+            and not envs.SGLANG_DSV4_DISABLE_WAR_FASTPATH.get()
+        ):
             self.schedule_stream.wait_event(ev)
             runner.war_fastpath_read_done_event = None
         else:
+            if ev is not None:
+                runner.war_fastpath_read_done_event = None
             self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
