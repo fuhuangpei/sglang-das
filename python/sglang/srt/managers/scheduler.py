@@ -853,6 +853,22 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
+
+        # Size and allocate the TARGET KV cache pool before any draft model
+        # weights are loaded. The pool capacity is derived from the free GPU
+        # memory at sizing time; loading the draft first (2.9 GB of weights on
+        # DSV4-EAGLE) silently shrank max_total_num_tokens from ~521k to ~88k
+        # tokens/rank (the SWA sub-pool from 52k to 8.7k), which saturates at
+        # ~6 running 16k-context requests and triggers retract_decode storms
+        # under high decode concurrency. The draft's KV demand is already
+        # accounted for in bytes_per_full_token via the (T+1)/T inflation in
+        # DSV4PoolConfigurator, so sizing before the draft load does not
+        # over-subscribe memory; the draft weights land in the post-pool slack
+        # (same order as the v0.5.12 target-ModelRunner.initialize() flow).
+        # init_target_memory_pool() is idempotent; the later init_memory_pools()
+        # call only allocates the draft pool reusing the target's config.
+        self.init_target_memory_pool()
+
         self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
