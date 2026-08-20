@@ -444,6 +444,25 @@ class DeepseekV4HipRadixBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
+        # CP topology (attn_cp_size > 1) must keep the decode metadata build
+        # OUT of the CUDA graph — mirrors DeepseekV4AttnBackend. The in-graph
+        # raw->full upgrade (init_forward_metadata_in_graph) mis-executes at
+        # replay under CP: captured decode graphs produce corrupted attention
+        # a few tokens into generation. Verified 2026-08-20 on gfx936 (8xHCU,
+        # CP8): the eager-built metadata route is correct; PREP=1 reproduces.
+        self.prep_in_cuda_graph = (
+            envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
+            and get_parallel().attn_cp_size == 1
+        )
+
+        # Backend-owned stable buffer backing the decode graph's
+        # `swa_out_cache_loc` rail: captured store kernels read this address
+        # and replay-prep (init_forward_metadata_out_graph) refreshes its
+        # contents, so no translate node is recorded inside the graph. An
+        # in-graph gather on a floating graph-pool tensor produced KV-slot
+        # cross-contamination at replay on this backend.
+        self._graph_swa_write_loc_buf: Optional[torch.Tensor] = None
+
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
@@ -487,7 +506,7 @@ class DeepseekV4HipRadixBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self.prep_in_cuda_graph:
             return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -787,11 +806,30 @@ class DeepseekV4HipRadixBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                        torch.int32
+                    )
                 )
-            )
+            elif forward_batch.forward_mode.is_decode_or_idle():
+                # Plain decode graph: bind the write loc to the backend-owned
+                # stable buffer (no kernel recorded). Replay-prep refreshes its
+                # contents from the live out_cache_loc before each replay —
+                # an in-graph gather on a floating graph-pool tensor here
+                # produced KV-slot cross-contamination at replay (mirrors the
+                # base DeepseekV4AttnBackend fix).
+                num_tokens = out_cache_loc.shape[0]
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    self._decode_swa_write_loc_buf(num_tokens)[:num_tokens]
+                )
+            else:
+                # target-verify and other captured modes keep the in-graph
+                # compute.
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                        torch.int32
+                    )
+                )
 
     def init_forward_metadata_out_graph(
         self,
@@ -860,6 +898,16 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
             )
+            # Replay-prep translate for the decode graph's SWA write-loc rail:
+            # refresh the stable buffer contents out-of-graph so the captured
+            # store kernels read verified already-physical locs (the graph
+            # itself records zero translate nodes on this rail). Runs both at
+            # capture (benign) and before every replay.
+            swa_write_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc_padded
+            ).to(torch.int32)
+            swa_write_buf = self._decode_swa_write_loc_buf(swa_write_loc.shape[0])
+            swa_write_buf[: swa_write_loc.shape[0]].copy_(swa_write_loc)
         elif bucket == _GraphBucket.TARGET_VERIFY:
             if resolve_ragged_verify_layout(forward_batch) is not None:
                 raise NotImplementedError(
@@ -1296,6 +1344,20 @@ class DeepseekV4HipRadixBackend(
                 final_pos=_ring_final_pos,
             )
         return o
+
+    def _decode_swa_write_loc_buf(self, num_tokens: int) -> torch.Tensor:
+        # Lazily-(re)sized persistent int32 buffer; contents refreshed by
+        # init_forward_metadata_out_graph before every graph replay.
+        buf = self._graph_swa_write_loc_buf
+        if buf is None or buf.numel() < num_tokens:
+            new_numel = max(num_tokens, buf.numel() if buf is not None else 0)
+            buf = torch.zeros(
+                new_numel,
+                dtype=torch.int32,
+                device=self.cuda_int32_kwargs["device"],
+            )
+            self._graph_swa_write_loc_buf = buf
+        return buf
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.

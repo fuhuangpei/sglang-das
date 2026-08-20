@@ -959,6 +959,37 @@ class Envs:
     # Debug: dump per-replay DSV4 attention metadata (rank0) to
     # /tmp/dsv4_replay_dump_r0.jsonl for corruption forensics.
     SGLANG_DSV4_DEBUG_REPLAY_DUMP = EnvBool(False)
+    # Debug: run the DSV4 MoE block eagerly as a breakable-cuda-graph break
+    # point (bisects decode-graph corruption between attention and MoE).
+    SGLANG_DSV4_DEBUG_BCG_EAGER_MOE = EnvBool(False)
+    # Debug: run decode attention (backend forward) eagerly as a
+    # breakable-cuda-graph break point (the native attention break is
+    # extend-only; this bisects decode-graph corruption).
+    SGLANG_DSV4_DEBUG_BCG_EAGER_ATTN = EnvBool(False)
+    # Debug: run the ENTIRE decoder layer eagerly as one breakable-cuda-graph
+    # break point (leaves only embedding/norm/lm-head/logits captured).
+    SGLANG_DSV4_DEBUG_BCG_EAGER_LAYER = EnvBool(False)
+    # Debug: run the whole self_attn block (projections, fused qk-norm-rope +
+    # SWA KV store, MLA core, o_proj) eagerly between graph segments.
+    SGLANG_DSV4_DEBUG_BCG_EAGER_ATTNBLK = EnvBool(False)
+    # Debug: run hc_pre/hc_post (mHC norm machinery) eagerly between graph
+    # segments — leaves only RMSNorm + residual adds captured per layer.
+    SGLANG_DSV4_DEBUG_BCG_EAGER_MHC = EnvBool(False)
+    # Debug: split-half variants of EAGER_MHC — eager-break only the hc_pre
+    # call sites or only the hc_post call sites, to bisect which half of the
+    # mHC machinery is capture-unsafe.
+    SGLANG_DSV4_DEBUG_BCG_EAGER_HC_PRE = EnvBool(False)
+    SGLANG_DSV4_DEBUG_BCG_EAGER_HC_POST = EnvBool(False)
+    # Debug: run only the attention prepare side (projections, KV store,
+    # indexer, compressor) eagerly; attention core + o_proj stay captured.
+    SGLANG_DSV4_DEBUG_BCG_EAGER_PREP = EnvBool(False)
+    # Debug: run only the attention output tail (inverse rope, wo_a einsum,
+    # wo_b gemm) eagerly; prep + attention core stay captured.
+    SGLANG_DSV4_DEBUG_BCG_EAGER_OPROJ = EnvBool(False)
+    # Debug: dump per-layer attnblk activation checksums from the debug break
+    # (works only with SGLANG_DSV4_DEBUG_BCG_EAGER_ATTNBLK=1) to
+    # SGLANG_DSV4_ACT_DUMP_PATH.<pid> for corrupt-vs-clean layer diffing.
+    SGLANG_DSV4_DEBUG_ACT_DUMP = EnvBool(False)
     # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)

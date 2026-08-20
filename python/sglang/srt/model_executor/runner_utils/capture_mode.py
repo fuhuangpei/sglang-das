@@ -48,6 +48,13 @@ def compile_in_capture_mode(func):
     torch.compile during cuda-graph capture without paying the
     compilation cost in the eager forward path.
     """
+    import os
+
+    # Debug/fix: torch.compile'd helpers captured into a HIP CUDA graph
+    # produce corrupt decode output (DSV4 hc_post); plain eager ops are
+    # graph-safe, so allow opting out.
+    if os.environ.get("SGLANG_DSV4_DEBUG_NO_CAPTURE_COMPILE", "0") == "1":
+        return func
     if is_capture_mode:
         return torch.compile(func)
     return func

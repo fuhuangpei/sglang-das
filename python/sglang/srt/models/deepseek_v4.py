@@ -186,6 +186,25 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+# One-shot flag proving a debug break marker actually fired under capture.
+_dsv4_dbg_break_fired = False
+# Activation-dump state (SGLANG_DSV4_DEBUG_ACT_DUMP=1): per-layer attnblk
+# input/output checksums for the first few forward calls, used to diff a
+# corrupt config against a clean one layer by layer.
+_dsv4_dbg_dump_calls = 0
+_dsv4_dbg_dump_fh = None
+
+
+def _dsv4_dbg_dump_fh_open():
+    global _dsv4_dbg_dump_fh
+    import os
+
+    path = os.environ.get("SGLANG_DSV4_ACT_DUMP_PATH", "/tmp/dsv4_act_dump.txt")
+    try:
+        _dsv4_dbg_dump_fh = open(f"{path}.{os.getpid()}", "w")
+    except OSError:
+        _dsv4_dbg_dump_fh = None
+
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
@@ -398,6 +417,178 @@ def deepseek_v4_attention_with_output(
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
 )
+
+
+def _dsv4_mlp_forward(mlp, hidden_states, forward_batch, **kwargs):
+    global _dsv4_dbg_break_fired
+    if not _dsv4_dbg_break_fired:
+        _dsv4_dbg_break_fired = True
+        logger.info("DSV4 debug: MoE break marker engaged")
+    return mlp(hidden_states, forward_batch, **kwargs)
+
+
+# Debug break point: run the whole MoE block (incl. DeepEP dispatch/combine)
+# eagerly between graph segments (SGLANG_DSV4_DEBUG_BCG_EAGER_MOE=1, only
+# effective under the breakable cuda-graph backend).
+bcg_dsv4_mlp_with_output = eager_on_graph(True)(_dsv4_mlp_forward)
+
+
+def _dsv4_attn_backend_forward(
+    attn_backend, q, k, o, layer, forward_batch, compress_ratio, attn_sink
+):
+    global _dsv4_dbg_break_fired
+    if not _dsv4_dbg_break_fired:
+        _dsv4_dbg_break_fired = True
+        logger.info("DSV4 debug: decode attention break marker engaged")
+    # NB: pass `k` for both k and v — the backend asserts k is v, and the
+    # break machinery weak-ref-wraps each tensor arg separately (which would
+    # break object identity for a duplicated argument).
+    ret = attn_backend.forward(
+        q=q,
+        k=k,
+        v=k,
+        layer=layer,
+        forward_batch=forward_batch,
+        compress_ratio=compress_ratio,
+        attn_sink=attn_sink,
+        save_kv_cache=False,
+    )
+    o[: ret.shape[0]].view(ret.shape).copy_(ret)
+    return o
+
+
+# Debug break point: run the whole decode attention (backend forward incl.
+# metadata reads) eagerly between graph segments
+# (SGLANG_DSV4_DEBUG_BCG_EAGER_ATTN=1, only effective under the breakable
+# cuda-graph backend; the native attention break is extend-only).
+bcg_dsv4_attn_backend_forward = eager_on_graph(True)(_dsv4_attn_backend_forward)
+
+
+def _dsv4_layer_forward(
+    layer,
+    positions,
+    hidden_states,
+    forward_batch,
+    input_ids,
+    input_ids_global,
+    prev_residual,
+    prev_post,
+    prev_comb,
+):
+    global _dsv4_dbg_break_fired
+    if not _dsv4_dbg_break_fired:
+        _dsv4_dbg_break_fired = True
+        logger.info("DSV4 debug: whole-layer break marker engaged")
+    return layer(
+        positions=positions,
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+        input_ids=input_ids,
+        input_ids_global=input_ids_global,
+        prev_residual=prev_residual,
+        prev_post=prev_post,
+        prev_comb=prev_comb,
+    )
+
+
+# Debug break point: run the ENTIRE decoder layer eagerly between graph
+# segments (SGLANG_DSV4_DEBUG_BCG_EAGER_LAYER=1) — leaves only embedding /
+# final norm / lm head / logits captured. Bisects decode-graph corruption
+# between "inside layers" and "head/logits or bridge machinery".
+bcg_dsv4_layer_forward = eager_on_graph(True)(_dsv4_layer_forward)
+
+
+def _dsv4_attnblk_forward(self_attn, x, positions, forward_batch, x_quant):
+    global _dsv4_dbg_break_fired, _dsv4_dbg_dump_calls
+    if not _dsv4_dbg_break_fired:
+        _dsv4_dbg_break_fired = True
+        logger.info("DSV4 debug: attention-block break marker engaged")
+    if envs.SGLANG_DSV4_DEBUG_ACT_DUMP.get():
+        if _dsv4_dbg_dump_fh is None:
+            _dsv4_dbg_dump_fh_open()
+        if _dsv4_dbg_dump_fh is not None:
+            _dsv4_dbg_dump_calls += 1
+            _dsv4_dbg_dump_fh.write(
+                f"call={_dsv4_dbg_dump_calls} attnblk layer={self_attn.layer_id} "
+                f"in={x.float().abs().mean().item():.6e} "
+                f"inr={x.float().abs().max().item():.6e}\n"
+            )
+            _dsv4_dbg_dump_fh.flush()
+    ret = self_attn(
+        x=x, positions=positions, forward_batch=forward_batch, x_quant=x_quant
+    )
+    if envs.SGLANG_DSV4_DEBUG_ACT_DUMP.get() and _dsv4_dbg_dump_fh is not None:
+        _dsv4_dbg_dump_fh.write(
+            f"call={_dsv4_dbg_dump_calls} attnblk layer={self_attn.layer_id} "
+            f"out={ret.float().abs().mean().item():.6e}\n"
+        )
+        _dsv4_dbg_dump_fh.flush()
+    return ret
+
+
+# Debug break point: run the whole self_attn block (projections, fused
+# qk-norm-rope + SWA KV store, MLA core, o_proj) eagerly between graph
+# segments (SGLANG_DSV4_DEBUG_BCG_EAGER_ATTNBLK=1).
+bcg_dsv4_attnblk_forward = eager_on_graph(True)(_dsv4_attnblk_forward)
+
+
+def _dsv4_attn_oproj(self_attn, o, tp_slice, positions):
+    global _dsv4_dbg_break_fired
+    if not _dsv4_dbg_break_fired:
+        _dsv4_dbg_break_fired = True
+        logger.info("DSV4 debug: attn o_proj-tail break marker engaged")
+    return self_attn._o_proj_tail(o, tp_slice, positions)
+
+
+# Debug break point: run only the attention output tail (inverse rope,
+# wo_a einsum, wo_b gemm) eagerly between graph segments
+# (SGLANG_DSV4_DEBUG_BCG_EAGER_OPROJ=1).
+bcg_dsv4_attn_oproj = eager_on_graph(True)(_dsv4_attn_oproj)
+
+
+def _dsv4_attn_prep(self_attn, enable_multi_stream, is_hip, x, positions, forward_batch, attn_backend, q_out, x_quant):
+    if enable_multi_stream:
+        if is_hip:
+            return self_attn._forward_prepare_multi_stream_hip(
+                x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
+            ), None
+        return self_attn._forward_prepare_multi_stream(
+            x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
+        ), None
+    return self_attn._forward_prepare(
+        x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
+    )
+
+
+# Debug break point: run only the attention "prepare" side (projections,
+# q/kv compute + SWA KV store, indexer, compressor) eagerly between graph
+# segments while the attention core + o_proj stay captured
+# (SGLANG_DSV4_DEBUG_BCG_EAGER_PREP=1).
+bcg_dsv4_attn_prep = eager_on_graph(True)(_dsv4_attn_prep)
+
+
+def _dsv4_hc_pre(layer, x, hc_fn, hc_scale, hc_base, norm, forward_batch):
+    global _dsv4_dbg_break_fired
+    if not _dsv4_dbg_break_fired:
+        _dsv4_dbg_break_fired = True
+        logger.info("DSV4 debug: hc_pre/hc_post break marker engaged")
+    return layer.hc_pre(
+        x, hc_fn, hc_scale, hc_base, norm=norm, forward_batch=forward_batch
+    )
+
+
+def _dsv4_hc_post(layer, x, residual, post, comb):
+    global _dsv4_dbg_break_fired
+    if not _dsv4_dbg_break_fired:
+        _dsv4_dbg_break_fired = True
+        logger.info("DSV4 debug: hc_pre/hc_post break marker engaged")
+    return layer.hc_post(x, residual, post, comb)
+
+
+# Debug break point: run hc_pre/hc_post (the whole mHC norm machinery)
+# eagerly between graph segments (SGLANG_DSV4_DEBUG_BCG_EAGER_MHC=1).
+bcg_dsv4_hc_pre = eager_on_graph(True)(_dsv4_hc_pre)
+bcg_dsv4_hc_post = eager_on_graph(True)(_dsv4_hc_post)
 
 
 class MqaAttentionBase(nn.Module):
@@ -1185,7 +1376,22 @@ class MQALayer(MqaAttentionBase):
                 ]
                 self._attn_sink_local = sink
 
-        if enable_multi_stream:
+        if (
+            envs.SGLANG_DSV4_DEBUG_BCG_EAGER_PREP.get()
+            and is_in_breakable_cuda_graph()
+        ):
+            q, kv = bcg_dsv4_attn_prep(
+                self,
+                enable_multi_stream,
+                _is_hip,
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant,
+            )
+        elif enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             if _is_hip:
@@ -1253,6 +1459,23 @@ class MQALayer(MqaAttentionBase):
                     self._attn_sink_local,
                     save_kv_cache,
                 )
+            elif (
+                envs.SGLANG_DSV4_DEBUG_BCG_EAGER_ATTN.get()
+                and is_in_breakable_cuda_graph()
+            ):
+                o = attn_q.new_empty(
+                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                )
+                bcg_dsv4_attn_backend_forward(
+                    attn_backend,
+                    attn_q,
+                    attn_k,
+                    o,
+                    self.attn_mqa,
+                    forward_batch,
+                    self.compress_ratio,
+                    self._attn_sink_local,
+                )
             else:
                 o = attn_backend.forward(
                     q=attn_q,
@@ -1264,7 +1487,17 @@ class MQALayer(MqaAttentionBase):
                     attn_sink=self._attn_sink_local,
                     save_kv_cache=save_kv_cache,
                 )
-            o = o[:, tp_slice, :]
+        if (
+            envs.SGLANG_DSV4_DEBUG_BCG_EAGER_OPROJ.get()
+            and is_in_breakable_cuda_graph()
+        ):
+            o = bcg_dsv4_attn_oproj(self, o, tp_slice, positions)
+        else:
+            o = self._o_proj_tail(o, tp_slice, positions)
+        return o
+
+    def _o_proj_tail(self, o, tp_slice, positions):
+        o = o[:, tp_slice, :]
         if _is_npu:
             v4_rope_inplace_npu(
                 o[..., -self.qk_rope_head_dim :],
@@ -1466,7 +1699,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if (
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+            # TileLang mHC kernels compute wrong results when captured into a
+            # CUDA graph on HIP (decode-graph output corruption); the torch
+            # fallback below is captured instead.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             if _is_hcu and _use_aiter_tilelang_mhc:
                 post, comb, y = mhc_pre_big_fuse(
                     residual=x,
@@ -1505,7 +1744,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_fused = norm is not None
             return y, post.squeeze(-1), comb, norm_fused
 
-        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+        if (
+            _is_hip
+            and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get()
+            # See hc_post: aiter mHC kernels compute wrong results when
+            # captured into a CUDA graph on HIP; the torch path below
+            # (hc_pre_torch_impl + hc_split_sinkhorn, which also falls back
+            # to torch under capture) is captured instead.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             from aiter.ops.mhc import mhc_pre
 
             post, comb, y = mhc_pre(
@@ -1575,7 +1822,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        if (
+            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+            # See hc_pre: TileLang mHC kernels corrupt under CUDA-graph capture.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             if _is_hcu and _use_aiter_tilelang_mhc:
                 return mhc_post_fwd(x, residual, post, comb)
             else:
@@ -1583,7 +1834,14 @@ class DeepseekV4DecoderLayer(nn.Module):
 
                 return mhc_post(x, residual, post, comb)
 
-        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+        elif (
+            _is_hip
+            and envs.SGLANG_OPT_USE_AITER_MHC_POST.get()
+            # The aiter mhc_post kernel computes wrong results when captured
+            # into a CUDA graph on HIP (decode-graph output corruption);
+            # fall through to the plain-torch impl below during capture.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             from aiter.ops.mhc import mhc_post
 
             result = torch.empty_like(residual)
@@ -1645,14 +1903,31 @@ class DeepseekV4DecoderLayer(nn.Module):
             x_quant = None
         else:
             residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                norm=self.input_layernorm,
-                forward_batch=forward_batch,
-            )
+            if (
+                (
+                    envs.SGLANG_DSV4_DEBUG_BCG_EAGER_MHC.get()
+                    or envs.SGLANG_DSV4_DEBUG_BCG_EAGER_HC_PRE.get()
+                )
+                and is_in_breakable_cuda_graph()
+            ):
+                hidden_states, post, comb, norm_fused = bcg_dsv4_hc_pre(
+                    self,
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm=self.input_layernorm,
+                    forward_batch=forward_batch,
+                )
+            else:
+                hidden_states, post, comb, norm_fused = self.hc_pre(
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm=self.input_layernorm,
+                    forward_batch=forward_batch,
+                )
             if not norm_fused:
                 if _use_aiter and _is_gfx95_supported:
                     x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
@@ -1666,12 +1941,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        hidden_states = self.self_attn(
-            x=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            x_quant=x_quant,
-        )
+        if (
+            envs.SGLANG_DSV4_DEBUG_BCG_EAGER_ATTNBLK.get()
+            and is_in_breakable_cuda_graph()
+        ):
+            hidden_states = bcg_dsv4_attnblk_forward(
+                self.self_attn,
+                hidden_states,
+                positions,
+                forward_batch,
+                x_quant,
+            )
+        else:
+            hidden_states = self.self_attn(
+                x=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                x_quant=x_quant,
+            )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1714,16 +2001,47 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
                 norm_fused = True
         else:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
-            residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                norm=self.post_attention_layernorm,
-                forward_batch=forward_batch,
+            _in_bcg = is_in_breakable_cuda_graph()
+            _hc_post_eager = (
+                (
+                    envs.SGLANG_DSV4_DEBUG_BCG_EAGER_MHC.get()
+                    or envs.SGLANG_DSV4_DEBUG_BCG_EAGER_HC_POST.get()
+                )
+                and _in_bcg
             )
+            _hc_pre_eager = (
+                (
+                    envs.SGLANG_DSV4_DEBUG_BCG_EAGER_MHC.get()
+                    or envs.SGLANG_DSV4_DEBUG_BCG_EAGER_HC_PRE.get()
+                )
+                and _in_bcg
+            )
+            if _hc_post_eager:
+                hidden_states = bcg_dsv4_hc_post(
+                    self, hidden_states, residual, post, comb
+                )
+            else:
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            residual = hidden_states
+            if _hc_pre_eager:
+                hidden_states, post, comb, norm_fused = bcg_dsv4_hc_pre(
+                    self,
+                    hidden_states,
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                    norm=self.post_attention_layernorm,
+                    forward_batch=forward_batch,
+                )
+            else:
+                hidden_states, post, comb, norm_fused = self.hc_pre(
+                    hidden_states,
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                    norm=self.post_attention_layernorm,
+                    forward_batch=forward_batch,
+                )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1735,7 +2053,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         if not use_fused:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if (
+                (
+                    envs.SGLANG_DSV4_DEBUG_BCG_EAGER_MHC.get()
+                    or envs.SGLANG_DSV4_DEBUG_BCG_EAGER_HC_POST.get()
+                )
+                and is_in_breakable_cuda_graph()
+            ):
+                hidden_states = bcg_dsv4_hc_post(
+                    self, hidden_states, residual, post, comb
+                )
+            else:
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
@@ -1837,13 +2166,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
         with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                skip_shared_experts=_do_shared_local,
-            )
+            if envs.SGLANG_DSV4_DEBUG_BCG_EAGER_MOE.get():
+                hidden_states = bcg_dsv4_mlp_with_output(
+                    self.mlp,
+                    hidden_states,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    skip_shared_experts=_do_shared_local,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    skip_shared_experts=_do_shared_local,
+                )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -2394,16 +2733,37 @@ class DeepseekV4Model(nn.Module):
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        forward_batch=forward_batch,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
-                    )
+                    if (
+                        envs.SGLANG_DSV4_DEBUG_BCG_EAGER_LAYER.get()
+                        and is_in_breakable_cuda_graph()
+                    ):
+                        (
+                            hidden_states,
+                            prev_residual,
+                            prev_post,
+                            prev_comb,
+                        ) = bcg_dsv4_layer_forward(
+                            layer,
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
+                        )
+                    else:
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
+                        )
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(

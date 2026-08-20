@@ -19,6 +19,7 @@ No torch.compile.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import fields as dc_fields, is_dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -151,6 +152,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return min([cap, *rows])
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
+        if is_dataclass(output) and not isinstance(output, type):
+            rows = [
+                self._output_rows(getattr(output, f.name), cap)
+                for f in dc_fields(output)
+                if torch.is_tensor(getattr(output, f.name))
+            ]
+            return min(rows) if rows else cap
         return cap
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
@@ -170,6 +178,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
+        if is_dataclass(output) and not isinstance(output, type):
+            # Dataclass outputs (e.g. LogitsProcessorOutput): reallocate tensor
+            # fields to `size` leading rows, keep non-tensor fields as-is.
+            kwargs = {}
+            for f in dc_fields(output):
+                val = getattr(output, f.name)
+                kwargs[f.name] = self._alloc_full_buffer(val, size)
+            return type(output)(**kwargs)
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
@@ -183,6 +199,16 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if is_dataclass(output) and not isinstance(output, type):
+            kwargs = {}
+            for f in dc_fields(output):
+                val = getattr(output, f.name)
+                if torch.is_tensor(val):
+                    kwargs[f.name] = self._slice_output(val, num_tokens)
+                else:
+                    # Non-tensor fields (None at capture time) pass through.
+                    kwargs[f.name] = val
+            return type(output)(**kwargs)
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -221,6 +247,19 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 )
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        if (
+            is_dataclass(output)
+            and not isinstance(output, type)
+            and is_dataclass(output_buffer)
+            and not isinstance(output_buffer, type)
+        ):
+            for f in dc_fields(output):
+                self._copy_output_to_buffer(
+                    getattr(output, f.name),
+                    getattr(output_buffer, f.name),
+                    num_tokens,
+                )
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "

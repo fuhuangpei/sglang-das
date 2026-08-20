@@ -250,6 +250,15 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
+    # The TileLang sinkhorn kernel computes wrong results when captured into a
+    # CUDA graph on HIP (decode-graph output corruption); fall back to the
+    # (numerically identical) torch impl while a graph is being captured.
+    # Replay only replays the recorded torch ops, and the eager serving path is
+    # unaffected, so this costs nothing outside capture.
+    if torch.cuda.is_current_stream_capturing():
+        return hc_split_sinkhorn_torch(
+            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+        )
     b, s, _ = mixes.size()
     pre = mixes.new_empty(b, s, hc_mult)
     post = mixes.new_empty(b, s, hc_mult)
