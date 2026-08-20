@@ -99,6 +99,11 @@ class DpPaddingMode(IntEnum):
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
+        # SGLANG_DCU_DP_MAX_LEN opts out of the DCU SUM_LEN workaround below, so
+        # dp_gather uses all_gather and the MoE output all_reduce + dp_scatter can
+        # fuse into a reduce_scatter.
+        if get_bool_env_var("SGLANG_DCU_DP_MAX_LEN"):
+            return cls.MAX_LEN
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
         if _USE_ROCM700A_WA or _is_hcu:
@@ -388,7 +393,39 @@ def get_dp_local_slice_cpu(
     return local_start_pos, local_num_tokens
 
 
-from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+import triton
+import triton.language as tl
+
+from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton, prod
+
+
+@triton.jit
+def _zero_tail_triton_kernel(
+    ptr,
+    num_valid_ptr,
+    total_elems,
+    chunk_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # zero ptr[num_valid * chunk_size : total_elems]
+    pid = tl.program_id(axis=0).to(tl.int64)
+    start = tl.load(num_valid_ptr).to(tl.int64) * chunk_size
+    offs = tl.arange(0, BLOCK_SIZE)
+    idx = start + pid * BLOCK_SIZE + offs
+    tl.store(
+        ptr + idx,
+        tl.zeros([BLOCK_SIZE], dtype=ptr.dtype.element_ty),
+        mask=idx < total_elems,
+    )
+
+
+def zero_tail_triton(buf: torch.Tensor, num_valid_rows: torch.Tensor):
+    """Zero buf[num_valid_rows:]; row count comes from a GPU tensor (cuda-graph safe)."""
+    BLOCK_SIZE = 8192
+    total_elems = buf.numel()
+    _zero_tail_triton_kernel[(triton.cdiv(total_elems, BLOCK_SIZE),)](
+        buf, num_valid_rows, total_elems, prod(buf.shape[1:]), BLOCK_SIZE=BLOCK_SIZE
+    )
 
 
 def _dp_gather_via_all_reduce(
@@ -428,6 +465,36 @@ def _dp_gather_via_all_reduce(
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
+def _aiter_all_gather_into_tensor(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> bool:
+    """all_gather over aiter's custom (IPC) path. True if it handled it.
+
+    Uses all_gather_unreg rather than custom_all_gather: the latter hardcodes
+    all_gather_reg while capturing and ignores enable_register_for_capturing, which
+    sglang deliberately leaves False on DCU.
+    """
+    # aiter custom comm is float-only, but dp_gather also carries input_ids.
+    if not local_tokens.dtype.is_floating_point:
+        return False
+    ca = getattr(get_tp_group(), "ca_comm", None)
+    if ca is None or getattr(ca, "disabled", True):
+        return False
+    if not hasattr(ca, "all_gather_unreg"):
+        return False
+    if local_tokens.numel() * local_tokens.element_size() > getattr(ca, "max_size", 0):
+        return False
+    # MAX_LEN lays the buffer out as rank * max_len; unlike the SUM_LEN path there is
+    # no fill_(0), so stale data in this rank's padding tail would be gathered into
+    # the global buffer and then routed as if it were real tokens.
+    _, local_num_tokens = get_dp_local_info(forward_batch)
+    zero_tail_triton(local_tokens, local_num_tokens)
+    ca.all_gather_unreg(local_tokens, out=global_tokens, dim=0)
+    return True
+
+
 def _dp_gather_via_all_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -435,6 +502,8 @@ def _dp_gather_via_all_gather(
     is_partial: bool,
 ):
     if get_attn_tensor_model_parallel_world_size() == 1:
+        if _aiter_all_gather_into_tensor(global_tokens, local_tokens, forward_batch):
+            return
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
@@ -596,6 +665,23 @@ def dp_scatter(
         )
 
 
+def _aiter_reduce_scatter_tensor(
+    output: torch.Tensor, input: torch.Tensor
+) -> bool:
+    """reduce_scatter over aiter's custom (IPC) path. True if it handled it."""
+    if not input.dtype.is_floating_point:
+        return False
+    ca = getattr(get_tp_group(), "ca_comm", None)
+    if ca is None or getattr(ca, "disabled", True):
+        return False
+    if not hasattr(ca, "reduce_scatter"):
+        return False
+    if input.numel() * input.element_size() > getattr(ca, "max_size", 0):
+        return False
+    ca.reduce_scatter(input, output, registered=False)
+    return True
+
+
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
@@ -606,6 +692,8 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
             return
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+        if _aiter_reduce_scatter_tensor(output, input):
+            return
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
         scattered_local_tokens = input.tensor_split(

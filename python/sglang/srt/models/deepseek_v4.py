@@ -1329,6 +1329,28 @@ class MQALayer(MqaAttentionBase):
         )
 
 
+def _should_reduce_scatter(use_tp_moe_gather, hidden_states, forward_batch) -> bool:
+    """Whether the MoE-output all_reduce + dp_scatter can fuse into a reduce_scatter.
+
+    Needs the MAX_LEN layout so per-rank segments are equal length; otherwise
+    reduce_scatter's even split does not line up with dp_scatter's offset. Mirrors
+    LayerCommunicator.should_use_reduce_scatter, which gates on the same condition.
+    """
+    if not use_tp_moe_gather:
+        return False
+    try:
+        from sglang.srt.layers.dp_attention import get_attention_dp_size
+
+        if not forward_batch.dp_padding_mode.is_max_len():
+            return False
+        dp_size = get_attention_dp_size()
+        if dp_size is None or dp_size <= 1:
+            return False
+        return hidden_states.shape[0] % dp_size == 0
+    except Exception:
+        return False
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
