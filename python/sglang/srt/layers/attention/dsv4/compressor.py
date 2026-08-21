@@ -34,6 +34,17 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_lightop,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
+from sglang.srt.layers.attention.dsv4.rlc import compute_rlc_metadata
+from sglang.srt.layers.dp_attention import (
+    attn_cp_all_to_all_single,
+    attn_cp_all_gather_into_tensor,
+)
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+    get_attn_cp_group,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
@@ -59,6 +70,16 @@ _is_npu = is_npu()
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
 )
+# RLC (Repartition-Local Compression): c4 prefill-CP communication optimization, default OFF.
+# When on (SGLANG_DSV4_COMPRESS_RLC=1) the attention c4 compressor replaces the all-gather of the
+# full kv_score with all-to-all repartition + local compress + all-gather of the compact output.
+# Correct for prefix=0 AND chunked prefix>0 (state-pool overlap patch + write) and non-aligned
+# lengths. Rewritten to match the validated prototype bench (mission_comprssor/.../test_accuracy_1.py).
+_use_dpskv4_compress_rlc = get_bool_env_var("SGLANG_DSV4_COMPRESS_RLC")
+# RLC run-time cache: data-independent metadata + derived GPU tensors + local compress plan depend
+# only on (ratio, extend_lens, prefix_lens, cp_rank, device), not on the layer. One forward's c4
+# layers reuse the same bundle; rebuilt only when the lengths change.
+_rlc_bundle_cache: dict = {}
 if _is_hcu:
     from lightop import op
 
@@ -403,6 +424,140 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
+def _rlc_prefix_aligned(forward_batch: ForwardBatch, ratio: int) -> bool:
+    """RLC's prefix-overlap patch assumes each sequence's prefix is a multiple of `ratio`, so the
+    extend-first block reads exactly the prefix's last block via the load_normal page. This holds for
+    page-aligned chunked prefill (chunks are page_size-aligned, a multiple of ratio); guard the rare
+    non-aligned-prefix case by falling back to the base path (which handles any prefix)."""
+    seq = forward_batch.seq_lens_cpu
+    ext = forward_batch.extend_seq_lens_cpu
+    if seq is None or ext is None:
+        return False
+    return all((int(s) - int(e)) % ratio == 0 for s, e in zip(seq, ext))
+
+
+def _get_rlc_bundle(extend_lens, prefix_lens, ratio, cp_size, cp_rank, device, write_plan):
+    """Build (and cache) the data-independent RLC metadata for one prefill chunk: routing tensors, the
+    local compress plan (v1) with PER-SEGMENT PREFIX, expansion rows, the per-segment global sequence
+    indices (used to gather load pages from the global paged metadata), and the state-pool WRITE
+    indices (compact/remap gather -- pure geometry from `write_plan`). Cached by
+    (ratio, cp_rank, device, extend_lens, prefix_lens) -> reused across all c4 layers of a forward.
+    Mirrors the prototype bench _rlc_chunk1_prep (one-shot variant)."""
+    key = (ratio, cp_rank, str(device),
+           tuple(int(x) for x in extend_lens), tuple(int(x) for x in prefix_lens))
+    bundle = _rlc_bundle_cache.get(key)
+    if bundle is not None:
+        return bundle
+
+    R = ratio
+    meta = compute_rlc_metadata(extend_lens, ratio, cp_size, cp_rank)
+    send_idx = torch.tensor(meta.send_idx, dtype=torch.long, device=device)
+    recv_perm = torch.tensor(meta.recv_perm, dtype=torch.long, device=device)
+    ev = torch.tensor(meta.ev, dtype=torch.long, device=device)
+
+    # Local compress plan (REAL v1) with PER-SEGMENT PREFIX. at_boundary segments carry their sequence's
+    # global prefix so the extend-first event lands at position prefix+R-1 -> the kernel does NOT mask it
+    # and reads R overlap slots from the (real) state pool at that sequence's load page; halo/first-chunk
+    # segments use prefix 0. Since prefix % R == 0 (page-aligned), event rows + window_len are identical
+    # to prefix=0 -- only masking / buffer-read behaviour changes. The buffer + load pages are supplied
+    # per-forward in _forward_rlc (the real state pool + global paged extra_data[seg_seqs]); no scratch.
+    n_recv = int(sum(meta.out_splits))
+    local_plan_c = None
+    local_ev = torch.empty(0, dtype=torch.long, device=device)
+    if n_recv > 0 and meta.local_extend_lens:
+        segs = meta.local_extend_lens
+        prefix_local = [int(prefix_lens[meta.local_seg_seqs[i]]) if meta.local_seg_boundary[i] else 0
+                        for i in range(len(segs))]
+        seq_local = [prefix_local[i] + segs[i] for i in range(len(segs))]
+        seq_t = torch.tensor(seq_local, dtype=torch.int64, device=device)
+        ext_t = torch.tensor(segs, dtype=torch.int64, device=device)
+        local_plan = CompressorPrefillPlan.generate(
+            compress_ratio=R, num_q_tokens=n_recv, seq_lens=seq_t, extend_lens=ext_t, device=device)
+        lev = local_plan.compress_plan.detach().cpu().contiguous().view(torch.int32)[:, 0]
+        local_ev = lev[(lev >= 0) & (lev < n_recv)].sort().values.long().to(device)
+        empty16 = torch.zeros((0, 16), dtype=torch.uint8, device=device)
+        local_plan_c = local_plan._replace(write_plan=empty16)   # compress-only (skip write kernel)
+
+    # global sequence index of each local segment -> used per-forward to gather load pages / write_loc
+    seg_seqs = torch.tensor(meta.local_seg_seqs, dtype=torch.long, device=device)
+
+    # state-pool WRITE indices (pure geometry). compress_forward's write kernel reads
+    # kv_score_input[ragged_id], but kv_score_local is only this rank's round-robin shard, so we gather
+    # ONLY the write-set: each rank fills its owned rows into a compact [W, 4H], all_reduce assembles the
+    # full set, and ragged_id is remapped to [0, W). ragged_id/batch_id/position/wlen depend only on the
+    # geometry (physical pages live in write_loc/extra_data, not in write_plan), so all of this caches.
+    empty16 = torch.zeros((0, 16), dtype=torch.uint8, device=device)
+    write_W = 0
+    write_mine_idx = torch.empty(0, dtype=torch.long, device=device)
+    write_src = torch.empty(0, dtype=torch.long, device=device)
+    write_remap = empty16
+    if write_plan is not None and write_plan.numel() > 0:
+        num_q = int(sum(int(x) for x in extend_lens))       # real global tokens (round-robin base)
+        wpi = write_plan.contiguous().view(torch.int32)      # [N, 4] = (ragged_id, batch_id, position, wlen)
+        g_all = wpi[:, 0].long()
+        wpi = wpi[(g_all >= 0) & (g_all < num_q)]            # drop cuda-graph padding rows (ragged_id == -1)
+        write_W = int(wpi.shape[0])
+        if write_W > 0:
+            wg = wpi[:, 0].long()                            # global write-set token indices
+            # LONG index (nonzero done ONCE here) so the per-layer write is a sync-free long-index
+            # scatter -- no per-layer bool mask -> no nonzero, no bool(.any()) DtoH sync.
+            write_mine_idx = (wg % cp_size == cp_rank).nonzero().flatten()   # positions in [0, W)
+            write_src = (wg[write_mine_idx] // cp_size).contiguous()         # source rows into this shard
+            remap = wpi.clone()
+            remap[:, 0] = torch.arange(write_W, dtype=torch.int32, device=device)   # ragged_id -> [0, W)
+            write_remap = remap.view(torch.uint8)
+
+    # local event rows with the halo already dropped (fold the [n_halo:] slice into a precomputed index)
+    local_ev_kept = local_ev[meta.n_halo:]
+
+    # compact gather index: after all-gather, `gathered` is [cp*max_c, H]; the compact output takes rows
+    # [r*max_c : r*max_c+counts[r]] for each rank r. Precompute those flat row ids -> one index_select
+    # per layer instead of a python cp-slice loop + torch.cat.
+    compact_rows = []
+    for r in range(cp_size):
+        base = r * meta.max_c
+        compact_rows.extend(range(base, base + meta.counts[r]))
+    compact_idx = torch.tensor(compact_rows, dtype=torch.long, device=device)
+
+    bundle = dict(
+        meta=meta, send_idx=send_idx, recv_perm=recv_perm, ev=ev,
+        local_plan_c=local_plan_c, local_ev_kept=local_ev_kept, seg_seqs=seg_seqs,
+        compact_idx=compact_idx,
+        write_W=write_W, write_mine_idx=write_mine_idx, write_src=write_src,
+        write_remap=write_remap, empty16=empty16,
+    )
+    if len(_rlc_bundle_cache) > 8:
+        _rlc_bundle_cache.clear()
+    _rlc_bundle_cache[key] = bundle
+    return bundle
+
+
+def _rlc_write_state(state_pool, kv_score_local, ape, paged, bundle, ratio, head_dim):
+    """Persist this chunk's trailing block(s) into the (replicated) state pool so the NEXT chunk reads
+    the correct overlap, using compress_forward's WRITE kernel. All index math (write-set filter,
+    ownership mask, gather-source rows, remapped ragged_id) is precomputed once per forward in
+    `_get_rlc_bundle` (pure geometry). Here we only: fill this rank's owned write rows into a compact
+    [W, 4H] buffer, all_reduce(SUM) so every rank holds the full write-set (each row owned by one rank),
+    then run the write kernel with the cached remapped plan -- reusing the global write_loc/extra_data so
+    it writes the SAME (page, slot) as base. An empty compress plan makes only the write kernel run."""
+    W = bundle["write_W"]
+    if W == 0:
+        return
+    write_buf = kv_score_local.new_zeros((W, kv_score_local.shape[1]))
+    write_src = bundle["write_src"]
+    if write_src.numel():
+        write_buf[bundle["write_mine_idx"]] = kv_score_local[write_src]
+    write_buf = get_attn_cp_group().all_reduce(write_buf)   # returns result (not in-place)
+    write_plan_c = paged.plan._replace(
+        compress_plan=bundle["empty16"], write_plan=bundle["write_remap"]
+    )
+    compress_forward(
+        kv_score_buffer=state_pool, kv_score_input=write_buf, ape=ape,
+        indices=paged.write_loc, plan=write_plan_c, compress_ratio=ratio,
+        head_dim=head_dim, extra_data=paged.extra_data,
+    )
+
+
 class Compressor(MultiPlatformOp):
     def __init__(
         self,
@@ -503,6 +658,21 @@ class Compressor(MultiPlatformOp):
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
+        # RLC (Repartition-Local Compression): attention c4 + prefill-CP + round-robin. Replaces the
+        # all-gather of the full kv_score with all-to-all repartition + local compress + all-gather of
+        # the compact output. Handles prefix=0 AND chunked prefix>0 (state-pool overlap patch + write)
+        # and non-aligned lengths. Indexer c4 stays on base (no RLC benefit at head_dim=128); a
+        # non-ratio prefix (never under page-aligned chunking) also falls back to base.
+        if (
+            _use_dpskv4_compress_rlc
+            and self.overlap
+            and not self.is_in_indexer
+            and dsa_use_prefill_cp(forward_batch)
+            and is_dsa_prefill_cp_round_robin_split()
+            and _rlc_prefix_aligned(forward_batch, self.ratio)
+        ):
+            return self._forward_rlc(x, forward_batch, attn_backend)
+
         kv_score = self.compute_kv_score(x, forward_batch)
 
         if TYPE_CHECKING:
@@ -540,3 +710,108 @@ class Compressor(MultiPlatformOp):
             )
 
         return get_attn_backend().forward_compress(self, x, forward_batch)
+
+    def _forward_rlc(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
+    ) -> torch.Tensor:
+        """Repartition-Local Compression path (attention c4, prefill-CP, round-robin).
+
+        Round-robin-scattered kv_score is all-to-all'd into per-rank contiguous block-runs (+halo),
+        each rank compresses its blocks locally with the real v1 kernel, and an all-gather recovers
+        the compact output in global block order. For chunked prefill (prefix>0) each sequence's
+        extend-first block reads its overlap from the (replicated) state pool -- patched locally on
+        the owning rank -- and the chunk's trailing block is persisted back for the next chunk.
+        Produces the same per-token output + state pool as the base path. Ported from the validated
+        prototype bench (test_accuracy_1.py: _rlc_chunk1_kernel + compressor_rlc).
+        """
+        from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+
+        cp_size = get_attn_context_model_parallel_world_size()
+        cp_rank = get_attn_context_model_parallel_rank()
+        R, H = self.ratio, self.head_dim
+        last_dim = 2 * (1 + self.overlap) * H          # 4H for c4
+        device = x.device
+
+        extend_lens = list(forward_batch.extend_seq_lens_cpu)
+        seq_lens = list(forward_batch.seq_lens_cpu)
+        prefix_lens = [int(s) - int(e) for s, e in zip(seq_lens, extend_lens)]
+
+        paged = attn_backend.get_paged_compress_metadata(R)   # (write_loc, extra_data, plan), global
+
+        bundle = _get_rlc_bundle(
+            extend_lens, prefix_lens, R, cp_size, cp_rank, device, paged.plan.write_plan
+        )
+        meta = bundle["meta"]
+
+        state_pool = self.get_state_pool(attn_backend).kv_score_buffer.kv_score.view(-1, R, last_dim)
+        core_meta = backend.forward_metadata.core_metadata
+        out_loc = core_meta.c4_out_loc if R == 4 else core_meta.c128_out_loc
+        num_q_out = out_loc.shape[0]                    # round-robin PADDED global token count (= n_local*cp)
+
+        # this rank's round-robin shard of the current chunk's kv_score (linear only on local tokens)
+        kv_score_local = linear_bf16_fp32(x, self.wkv_gate.weight)     # [n_local, 4H]
+
+        # Pin the RLC precondition: x must be the EQUAL-LENGTH round-robin shard of the padded-global
+        # tokens. All routing/write indices use the mapping (global g -> rank g%cp, local row g//cp),
+        # which is correct only when n_local*cp == padded global. Guaranteed today by can_nsa_cp_split
+        # (sum(extend) % cp == 0) + the upstream round-robin split; assert so any upstream change fails
+        # loudly here instead of silently misaligning the shard.
+        assert kv_score_local.shape[0] * cp_size == num_q_out, (
+            f"RLC expects an equal-length round-robin shard: n_local({kv_score_local.shape[0]}) "
+            f"* cp({cp_size}) != out_loc({num_q_out})"
+        )
+
+        # (1) all-to-all repartition -> owned blocks (+halo), reranged ascending
+        send = (kv_score_local[bundle["send_idx"]].contiguous()
+                if bundle["send_idx"].numel() else kv_score_local.new_empty((0, last_dim)))
+        recv = kv_score_local.new_empty((sum(meta.out_splits), last_dim))
+        attn_cp_all_to_all_single(recv, send, meta.out_splits, meta.in_splits)
+        local_kv = recv[bundle["recv_perm"]].contiguous() if bundle["recv_perm"].numel() else recv
+
+        # (2) local compress via v1 compress_forward (COMPRESS pass only) -- ONE-SHOT prefix>0. The
+        #     buffer is the REAL state pool; load pages = the global paged extra_data gathered per local
+        #     segment; the plan carries per-segment prefix. So the kernel reads each extend-first block's
+        #     prefix overlap straight from the state pool (masking true first blocks at position R-1) --
+        #     no separate patch. Reads only (write_plan empty -> no write); the state-pool write is (7).
+        ape = self.ape.view(-1, H)
+        if local_kv.shape[0] > 0 and bundle["local_plan_c"] is not None:
+            seg_seqs = bundle["seg_seqs"]
+            local_sparse = compress_forward(
+                kv_score_buffer=state_pool, kv_score_input=local_kv, ape=ape,
+                indices=paged.write_loc[seg_seqs], plan=bundle["local_plan_c"],
+                compress_ratio=R, head_dim=H, extra_data=paged.extra_data[seg_seqs])
+            local_out = local_sparse[bundle["local_ev_kept"]].clone()   # event rows, halo already dropped
+        else:
+            local_out = kv_score_local.new_empty((0, H))
+
+        # (3) all-gather compact per-rank outputs -> global block order (single index_select via
+        #     precomputed compact_idx; no python cp-slice loop + torch.cat)
+        padded = local_out.new_zeros((meta.max_c, H))
+        if local_out.shape[0] > 0:
+            padded[:local_out.shape[0]] = local_out
+        gathered = local_out.new_empty((cp_size * meta.max_c, H))
+        attn_cp_all_gather_into_tensor(gathered, padded)
+        compact = gathered[bundle["compact_idx"]]           # [sum(counts), H] == global block order
+
+        # (4) expand to per-token [num_q_out, H] at event rows; non-event/partial-tail rows stay 0 and
+        #     are routed to the reserved dummy slot 0 by c4_out_loc downstream (never read).
+        full = kv_score_local.new_zeros((num_q_out, H))
+        full[bundle["ev"]] = compact.to(full.dtype)
+
+        # (5) global norm/rope (driven by the paged plan -> transforms exactly the event rows)
+        compress_fused_norm_rope_inplace(
+            full,
+            self.norm.weight,
+            getattr(self.norm, "eps", self.norm.variance_epsilon),
+            self.freqs_cis,
+            paged.plan,
+        )
+
+        # (6) persist this chunk's trailing block(s) into the state pool for the next chunk (via
+        #     compress_forward's write kernel: compact + remapped ragged_id)
+        _rlc_write_state(state_pool, kv_score_local, ape, paged, bundle, R, H)
+
+        return rotate_activation(full) if self.rotate else full
